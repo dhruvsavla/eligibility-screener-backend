@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import init_db
 from app.services.concept_matcher import snomed_matcher
 from app.services.ner_service import ner_service
-from app.routers import protocols, patients, screening, health
+from app.routers import protocols, patients, screening, health, evaluation
 
 
 @asynccontextmanager
@@ -19,6 +19,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing database...")
     await init_db()
+
+    logger.info("Running evaluation schema migration...")
+    from app.routers.evaluation import _ensure_gt_columns
+    await _ensure_gt_columns()
 
     logger.info("Building FAISS SNOMED index...")
     snomed_matcher.build_index()
@@ -79,3 +83,4 @@ app.include_router(health.router)
 app.include_router(protocols.router)
 app.include_router(patients.router)
 app.include_router(screening.router)
+app.include_router(evaluation.router)

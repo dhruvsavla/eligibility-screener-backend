@@ -33,7 +33,10 @@ async def _parse_patient_from_db(row: dict) -> dict:
 @router.get("")
 async def list_patients(skip: int = 0, limit: int = 20):
     rows = await db.fetch_all(
-        "SELECT id, patient_id, name, age, gender, created_at FROM patients ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        """SELECT id, patient_id, name, age, gender, created_at
+           FROM patients
+           WHERE is_ground_truth IS NULL OR is_ground_truth = 0
+           ORDER BY created_at DESC LIMIT ? OFFSET ?""",
         (limit, skip),
     )
     logger.info("Listed {} patients (skip={} limit={})", len(rows), skip, limit)
@@ -42,7 +45,9 @@ async def list_patients(skip: int = 0, limit: int = 20):
 
 @router.get("/count")
 async def count_patients():
-    row = await db.fetch_one("SELECT COUNT(*) as total FROM patients")
+    row = await db.fetch_one(
+        "SELECT COUNT(*) as total FROM patients WHERE is_ground_truth IS NULL OR is_ground_truth = 0"
+    )
     return {"total": row["total"] if row else 0}
 
 
@@ -57,7 +62,37 @@ async def get_patient(patient_id: int):
 @router.post("/generate")
 async def generate_patients(request: GeneratePatientsRequest):
     logger.info("Generating {} synthetic patients...", request.count)
-    bundles = synthea_generator.generate_patients(request.count, seed=request.seed)
+
+    # Try real Synthea first
+    source = "python_fallback"
+    synthea_available = False
+    bundles = []
+
+    try:
+        from app.services.synthea_runner import synthea_runner, SyntheaNotAvailableError, SyntheaGenerationError
+        prereqs = synthea_runner.check_prerequisites()
+        synthea_available = prereqs["can_run"]
+
+        if synthea_available:
+            logger.info("Using real MITRE Synthea for patient generation")
+            bundles = synthea_runner.generate(count=request.count, seed=request.seed)
+            source = "synthea"
+        else:
+            logger.warning("Synthea not available — using Python fallback generator")
+            logger.warning("  Reason: {}", prereqs["reason"])
+            logger.warning("  To enable real Synthea: see backend/synthea/SETUP.md")
+    except (SyntheaNotAvailableError, SyntheaGenerationError) as e:
+        logger.warning("Synthea failed: {} — falling back to Python generator", e)
+    except Exception as e:
+        logger.warning("Synthea check error: {} — using Python fallback", e)
+
+    if not bundles:
+        if source != "python_fallback":
+            logger.warning(
+                "Patient data will be functional but less clinically detailed than real Synthea"
+            )
+        bundles = synthea_generator.generate_patients(request.count, seed=request.seed)
+        source = "python_fallback"
 
     created = []
     for bundle in bundles:
@@ -89,8 +124,13 @@ async def generate_patients(request: GeneratePatientsRequest):
         except Exception as e:
             logger.error("Failed to save synthetic patient: {}", e)
 
-    logger.info("✓ Created {} patients in DB", len(created))
-    return created
+    logger.info("✓ Created {} patients in DB (source={})", len(created), source)
+    return {
+        "patients": created,
+        "source": source,
+        "synthea_available": synthea_available,
+        "count": len(created),
+    }
 
 
 @router.post("/upload")

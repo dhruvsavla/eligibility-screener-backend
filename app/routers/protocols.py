@@ -1,6 +1,7 @@
 import time
 from fastapi import APIRouter, HTTPException
 from loguru import logger
+from pydantic import BaseModel
 from app import database as db
 from app.models.protocol import (
     Protocol,
@@ -11,6 +12,7 @@ from app.models.protocol import (
 from app.services.trials_fetcher import clinical_trials_client
 from app.services.criteria_extractor import criteria_extractor
 from app.services.concept_matcher import snomed_matcher
+from app.services.pdf_protocol_parser import PDFProtocolParser
 
 router = APIRouter(prefix="/api/protocols", tags=["protocols"])
 
@@ -145,6 +147,72 @@ async def upload_protocol(request: UploadProtocolRequest):
         rules=rules,
     )
     return proto
+
+
+class FetchPDFRequest(BaseModel):
+    nct_id: str
+
+
+@router.post("/fetch-pdf")
+async def fetch_protocol_pdf(request: FetchPDFRequest):
+    """Fetch a specific protocol by NCT ID using the full PDF pipeline."""
+    start = time.time()
+    nct_id = request.nct_id.strip().upper()
+    logger.info("Fetching protocol {} with PDF pipeline...", nct_id)
+
+    # Get base trial data from API
+    trial = clinical_trials_client.fetch_by_nct_id(nct_id)
+    api_criteria_text = trial.get("eligibility_criteria", "")
+
+    # Try PDF enrichment
+    pdf_parser = PDFProtocolParser()
+    pdf_url = pdf_parser.get_protocol_pdf_url(nct_id)
+    pdf_used = False
+    pdf_page_count = 0
+    enrichment_chars = 0
+
+    if pdf_url:
+        try:
+            full_text = pdf_parser.download_and_extract_text(pdf_url)
+            import io
+            try:
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(
+                    __import__("requests").get(pdf_url, timeout=30).content
+                )) as pdf:
+                    pdf_page_count = len(pdf.pages)
+            except Exception:
+                pass
+            pdf_section = pdf_parser.extract_eligibility_section(full_text, nct_id)
+            if pdf_section.strip():
+                merged = pdf_parser.merge_criteria(api_criteria_text, pdf_section, nct_id)
+                enrichment_chars = len(merged) - len(api_criteria_text)
+                trial["eligibility_criteria"] = merged
+                pdf_used = True
+        except Exception as e:
+            logger.warning("⚠ PDF pipeline failed for {}: {} — using API text", nct_id, e)
+
+    # Extract criteria and save
+    rules = criteria_extractor.extract(trial["eligibility_criteria"], nct_id)
+    proto = await _save_protocol_and_rules(
+        nct_id=nct_id,
+        title=trial.get("title", ""),
+        condition=trial.get("condition", ""),
+        phase=trial.get("phase", ""),
+        sponsor=trial.get("sponsor", ""),
+        raw_criteria_text=trial["eligibility_criteria"],
+        rules=rules,
+    )
+
+    elapsed = int((time.time() - start) * 1000)
+    logger.info("✓ PDF fetch pipeline complete for {} in {}ms (pdf_used={})", nct_id, elapsed, pdf_used)
+
+    return {
+        "protocol": proto,
+        "pdf_used": pdf_used,
+        "pdf_page_count": pdf_page_count,
+        "enrichment_chars": enrichment_chars,
+    }
 
 
 @router.delete("/{protocol_id}")

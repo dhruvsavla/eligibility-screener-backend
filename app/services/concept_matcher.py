@@ -1,7 +1,17 @@
+"""
+Unified ConceptMatcher — uses OMOP vocabulary when available,
+falls back to the hardcoded SNOMED list when OMOP files are absent.
+
+The singleton `snomed_matcher` is kept for backward compatibility with
+all existing callers (scoring_engine, protocols router, health router).
+"""
+
 import time
 import numpy as np
 from loguru import logger
 from typing import Optional
+
+from app.services.omop_vocabulary import OMOPVocabulary
 
 SNOMED_CONCEPTS = [
     {"code": "44054006", "term": "Type 2 diabetes mellitus"},
@@ -70,7 +80,7 @@ SNOMED_CONCEPTS = [
     {"code": "69896004", "term": "Rheumatoid arthritis"},
     {"code": "200936003", "term": "Lupus systemic lupus erythematosus"},
     {"code": "24526004", "term": "Inflammatory bowel disease"},
-    {"code": "9014002", "term": "Psoriasis"},
+    {"code": "9014002",  "term": "Psoriasis"},
     {"code": "86406008", "term": "HIV AIDS"},
     {"code": "40122008", "term": "Pneumonia"},
     {"code": "14189004", "term": "Active tuberculosis"},
@@ -79,8 +89,12 @@ SNOMED_CONCEPTS = [
 ]
 
 
-class SNOMEDConceptMatcher:
-    _instance: Optional["SNOMEDConceptMatcher"] = None
+class ConceptMatcher:
+    """
+    Unified concept matcher: uses OMOP when available, FAISS+SNOMED fallback otherwise.
+    Exposes find_best_match() and build_index() for backward compatibility.
+    """
+    _instance: Optional["ConceptMatcher"] = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -88,7 +102,30 @@ class SNOMEDConceptMatcher:
             cls._instance._index = None
             cls._instance._model = None
             cls._instance._embeddings = None
+            cls._instance._omop = None
+            cls._instance._using_omop = False
         return cls._instance
+
+    def _init_omop(self):
+        if self._omop is not None:
+            return
+        self._omop = OMOPVocabulary()
+        status = self._omop.check_files()
+        if status["omop_available"]:
+            try:
+                self._omop.load()
+                self._using_omop = True
+                n = self._omop.get_concept_count() or 0
+                logger.info("✓ ConceptMatcher using OMOP vocabulary ({} concepts)", n)
+            except Exception as e:
+                logger.warning("⚠ OMOP load failed: {} — falling back to SNOMED FAISS", e)
+                self._using_omop = False
+        else:
+            logger.warning(
+                "ConceptMatcher using hardcoded SNOMED fallback (80 concepts): {}",
+                status["reason"]
+            )
+            self._using_omop = False
 
     def _get_model(self):
         if self._model is None:
@@ -98,7 +135,10 @@ class SNOMEDConceptMatcher:
         return self._model
 
     def build_index(self):
+        """Build FAISS index. Also initializes OMOP if files are present."""
         import faiss
+
+        self._init_omop()
 
         logger.info("Building FAISS SNOMED index with {} concepts...", len(SNOMED_CONCEPTS))
         start = time.time()
@@ -109,9 +149,26 @@ class SNOMEDConceptMatcher:
         self._index = faiss.IndexFlatIP(dim)
         self._index.add(np.array(self._embeddings, dtype="float32"))
         elapsed = int((time.time() - start) * 1000)
-        logger.info("✓ SNOMED index built in {}ms ({} concepts indexed)", elapsed, len(SNOMED_CONCEPTS))
+        logger.info(
+            "✓ SNOMED index built in {}ms ({} concepts indexed)", elapsed, len(SNOMED_CONCEPTS)
+        )
 
     def find_best_match(self, query: str, top_k: int = 3) -> list[dict]:
+        # Try OMOP first
+        if self._using_omop and self._omop:
+            omop_results = self._omop.search(query, top_k)
+            if omop_results:
+                return [
+                    {
+                        "code": r["concept_code"],
+                        "term": r["concept_name"],
+                        "vocabulary": r.get("vocabulary_id", "OMOP"),
+                        "score": r["score"],
+                    }
+                    for r in omop_results
+                ]
+
+        # FAISS fallback
         if self._index is None:
             logger.warning("FAISS index not built — building on-demand")
             self.build_index()
@@ -134,13 +191,24 @@ class SNOMEDConceptMatcher:
             )
             logger.debug(
                 "  SNOMED match: '{}' → '{}' (code: {}, score: {:.3f})",
-                query,
-                concept["term"],
-                concept["code"],
-                score,
+                query, concept["term"], concept["code"], score,
             )
 
         return results
 
+    def get_status(self) -> dict:
+        self._init_omop()
+        concept_count = (
+            self._omop.get_concept_count()
+            if self._using_omop and self._omop
+            else len(SNOMED_CONCEPTS)
+        )
+        return {
+            "mode": "omop" if self._using_omop else "fallback",
+            "concept_count": concept_count,
+            "omop_available": self._using_omop,
+        }
 
-snomed_matcher = SNOMEDConceptMatcher()
+
+# Singleton — backward compatible name
+snomed_matcher = ConceptMatcher()

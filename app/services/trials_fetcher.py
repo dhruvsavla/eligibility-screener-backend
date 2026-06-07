@@ -108,8 +108,16 @@ class ClinicalTrialsClient:
 
         criteria_text = elig_mod.get("eligibilityCriteria", "")
         logger.info(
-            "✓ Fetched {}: criteria preview: {}...", nct_id, criteria_text[:200]
+            "✓ Fetched {}: {} chars of eligibility criteria", nct_id, len(criteria_text)
         )
+
+        # Attempt PDF enrichment
+        try:
+            from app.services.pdf_protocol_parser import PDFProtocolParser
+            pdf_parser = PDFProtocolParser()
+            criteria_text = pdf_parser.parse_protocol(nct_id, criteria_text)
+        except Exception as pdf_err:
+            logger.warning("⚠ PDF enrichment failed for {}: {} — using API text", nct_id, pdf_err)
 
         return {
             "nct_id": id_mod.get("nctId", nct_id),

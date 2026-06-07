@@ -48,3 +48,13 @@ htmlcov/
 *.pkl
 *.npy
 models/
+
+# Synthea — JAR and generated output must not be committed
+synthea/synthea.jar
+synthea/output/
+synthea/metadata/
+
+# OMOP vocabulary files are too large for git
+omop/CONCEPT.csv
+omop/CONCEPT_SYNONYM.csv
+omop/CONCEPT_RELATIONSHIP.csv
