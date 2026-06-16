@@ -78,10 +78,13 @@ async def _run_screening(patient_db_id: int, protocol_id: int, use_gpt_rationale
         )
     logger.info("Rationale generation took {}ms (gpt={})", int((time.time() - t0) * 1000), use_gpt_rationale)
 
+    score_breakdown_json = json.dumps(scoring_result.score_breakdown)
+
     result_id = await db.execute(
         """INSERT INTO screening_results
-           (patient_id, protocol_id, fit_score, confidence_low, confidence_high, overall_verdict, rationale_summary)
-           VALUES (?,?,?,?,?,?,?)""",
+           (patient_id, protocol_id, fit_score, confidence_low, confidence_high,
+            overall_verdict, rationale_summary, score_breakdown_json)
+           VALUES (?,?,?,?,?,?,?,?)""",
         (
             patient_db_id,
             protocol_id,
@@ -90,6 +93,7 @@ async def _run_screening(patient_db_id: int, protocol_id: int, use_gpt_rationale
             scoring_result.confidence_high,
             scoring_result.overall_verdict.value,
             rationale,
+            score_breakdown_json,
         ),
     )
 
@@ -127,11 +131,24 @@ async def _get_full_result(result_id: int, patient_row: dict = None, protocol_ro
         "SELECT * FROM criterion_evaluations WHERE result_id = ? ORDER BY id", (result_id,)
     )
 
+    # Parse score_breakdown_json → score_breakdown dict
+    score_breakdown = None
+    raw_json = result.get("score_breakdown_json")
+    if raw_json:
+        try:
+            score_breakdown = json.loads(raw_json)
+        except Exception:
+            pass
+
+    result_dict = dict(result)
+    result_dict.pop("score_breakdown_json", None)  # exclude raw JSON field from response
+
     return {
-        **result,
+        **result_dict,
         "patient_name": patient_row.get("name", ""),
         "protocol_title": protocol_row.get("title", ""),
-        "criterion_evaluations": evals,
+        "criterion_evaluations": [dict(e) for e in evals],
+        "score_breakdown": score_breakdown,
     }
 
 
@@ -155,7 +172,7 @@ async def batch_screen(request: BatchScreenRequest):
     for i, pid in enumerate(request.patient_ids):
         try:
             logger.info("  Screening patient {} ({}/{})", pid, i + 1, len(request.patient_ids))
-            # Skip GPT-4o rationale in batch mode — use fast fallback instead.
+            # Skip Claude Sonnet rationale in batch mode — use fast fallback instead.
             # Full rationale can be fetched per-patient from the Results page.
             result = await _run_screening(pid, request.protocol_id, use_gpt_rationale=False)
             results.append(result)

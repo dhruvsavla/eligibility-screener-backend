@@ -56,5 +56,6 @@ synthea/metadata/
 
 # OMOP vocabulary files are too large for git
 omop/CONCEPT.csv
+omop/CONCEPT_ANCESTOR.csv
 omop/CONCEPT_SYNONYM.csv
 omop/CONCEPT_RELATIONSHIP.csv

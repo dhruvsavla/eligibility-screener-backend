@@ -7,7 +7,7 @@ Pipeline:
   1. Query CT.gov API v2 for the study's document URLs
   2. If a protocol PDF exists → download it
   3. Extract text using pdfplumber (primary) with PyMuPDF fallback
-  4. Use GPT-4o to locate and extract the Eligibility section
+  4. locate_eligibility_section() finds inclusion+exclusion in FULL text
   5. Merge PDF-extracted criteria with API criteria (deduplicate)
   6. Return enriched criteria text
 
@@ -18,6 +18,7 @@ Fallback chain:
 """
 
 import io
+import re
 import time
 from loguru import logger
 from app.config import settings
@@ -121,82 +122,187 @@ class PDFProtocolParser:
         )
         return text
 
-    def extract_eligibility_section(self, full_pdf_text: str, nct_id: str) -> str:
-        """Use GPT-4o to locate and return only the eligibility criteria section."""
-        from openai import OpenAI
+    def locate_eligibility_section(self, full_text: str, max_section_chars: int = 40000) -> str:
+        """
+        Locate the inclusion+exclusion criteria section in FULL protocol text using
+        pure-Python regex — no character limit, no Claude call.
 
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        logger.info("Using GPT-4o to locate eligibility section in PDF for {}...", nct_id)
+        Key challenge: Table of Contents entries also contain "inclusion criteria" /
+        "exclusion criteria" but are fake (just page references like "8.1 Inclusion
+        Criteria ............ 30").  We detect and skip ToC entries by checking for
+        5+ consecutive dots within 200 chars after the marker.
 
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                temperature=0,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a clinical document parser. Given full protocol PDF text, "
-                            "extract ONLY the section containing Inclusion Criteria and Exclusion Criteria. "
-                            "Return the raw text of that section verbatim. Do not summarize or interpret. "
-                            "If no eligibility section is found, return an empty string."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Extract the eligibility criteria section from this protocol PDF for {nct_id}:\n\n"
-                            f"{full_pdf_text[:15000]}"
-                        ),
-                    },
-                ],
+        Strategy:
+          1. Find ALL "inclusion criteria" positions that are NOT ToC entries.
+          2. For each real candidate, find the nearest following "exclusion criteria"
+             that is also not a ToC entry, within 30 000 chars.
+          3. Start at the section header above the inclusion marker (back up to the
+             preceding newline, up to 300 chars).
+          4. End after the exclusion block: first major section header found after
+             the exclusion start, or +20 000 chars if none found.
+          5. Cap the returned section at max_section_chars.
+        """
+        lower = full_text.lower()
+
+        def _is_toc_entry(pos: int) -> bool:
+            # ToC entries have trailing dots ("........30") within 200 chars after the marker.
+            ahead = lower[pos: pos + 200]
+            return bool(re.search(r"\.{5,}", ahead))
+
+        def _is_section_header(pos: int) -> bool:
+            # Real section headers have ONLY whitespace or a section number (e.g. "8.1.")
+            # between the preceding newline and the marker.
+            # Inline mentions like "Entered patients who meet the inclusion criteria"
+            # have full words on the same line before the marker.
+            before = lower[max(0, pos - 200): pos]
+            last_nl = before.rfind("\n")
+            if last_nl == -1:
+                # No preceding newline: valid if text starts here (API-style criteria
+                # that begins with "Inclusion Criteria:") or the before slice is whitespace only.
+                return pos <= 5 or len(before.strip()) == 0
+            same_line = before[last_nl + 1:].strip()
+            # Allow empty line (header alone) or section numbers like "8.1.", "1.", "(a)"
+            return bool(re.match(r'^[\d.()\s]*$', same_line))
+
+        incl_positions = [m.start() for m in re.finditer(r"inclusion criteria", lower)
+                          if not _is_toc_entry(m.start()) and _is_section_header(m.start())]
+        excl_positions = [m.start() for m in re.finditer(r"exclusion criteria", lower)
+                          if not _is_toc_entry(m.start())]
+
+        logger.info(
+            "locate_eligibility_section: {} real incl markers, {} real excl markers (ToC entries skipped)",
+            len(incl_positions), len(excl_positions),
+        )
+
+        if not incl_positions and not excl_positions:
+            logger.warning("No real eligibility markers found — returning full text (capped)")
+            return full_text[:max_section_chars]
+
+        # Find an inclusion marker paired with a following exclusion section header.
+        # Minimum 500-char gap filters out inline mentions like "meet the inclusion criteria
+        # and do not meet any of the exclusion criteria" which are only ~50 chars apart.
+        MIN_SECTION_GAP = 500
+        start = None
+        for inc_pos in incl_positions:
+            following_excl = [e for e in excl_positions
+                              if inc_pos + MIN_SECTION_GAP < e < inc_pos + 30000]
+            if following_excl:
+                start = inc_pos
+                logger.info(
+                    "Paired eligibility section: inclusion at char {:,}, exclusion at char {:,}",
+                    inc_pos, following_excl[0],
+                )
+                break
+
+        if start is None:
+            # Fallback: use last real inclusion marker (or first exclusion marker).
+            if incl_positions:
+                start = incl_positions[-1]
+                logger.warning("No paired incl/excl — using last inclusion marker at {:,}", start)
+            else:
+                start = excl_positions[0]
+                logger.warning("No inclusion marker — starting at first exclusion at {:,}", start)
+
+        # Back up to the nearest newline above start to capture the section header.
+        header_lookback = full_text.rfind("\n", max(0, start - 300), start)
+        if header_lookback != -1:
+            start = header_lookback
+
+        # Find the END: next PEER or HIGHER section heading after the exclusion marker.
+        # We deliberately search for peer/higher sections only (e.g. "8.3 Discontinuations"
+        # after "8.2 Exclusion Criteria"), and NOT sub-sections like "8.2.1 Rationale"
+        # which are WITHIN the exclusion section and should be included.
+        real_excl_in_range = [e for e in excl_positions if e >= start]
+        first_excl = real_excl_in_range[0] if real_excl_in_range else None
+
+        end = len(full_text)
+        if first_excl is not None:
+            # Search starts well after the exclusion header to skip sub-section content.
+            # Use a generous buffer (2,000 chars) before looking for the next section.
+            search_from = first_excl + 2000
+            # Patterns for PEER/HIGHER level sections only.
+            # "discontinuations", "study procedures", "treatment", etc. as standalone headings.
+            # Avoid matching "8.2.1" style sub-sections — use \b word-boundary patterns
+            # for English section names rather than numeric patterns.
+            end_patterns = [
+                r"\ndiscontinuation",      # "8.3 Discontinuations" / "Discontinuation"
+                r"\nstudy procedures",
+                r"\nstudy visits",
+                r"\nvisit schedule",
+                r"\ntreatment period",
+                r"\nrandomization\s*\n",
+                r"\npharmacoki",
+                r"\nstatistical",
+                r"\nadverse event",
+                r"\nappendix",
+            ]
+            candidate_ends = []
+            sub = lower[search_from:]
+            for pat in end_patterns:
+                m = re.search(pat, sub)
+                if m:
+                    candidate_ends.append(search_from + m.start())
+            if candidate_ends:
+                end = min(candidate_ends)
+                logger.info("Eligibility section ends at char {:,} (next section header)", end)
+            else:
+                # Generous safety cap after the exclusion start — eligibility sections
+                # are typically ≤ 15 000 chars even in large protocols.
+                end = min(first_excl + 15000, len(full_text))
+                logger.info("No section-end marker found — using +15k cap at {:,}", end)
+
+        section = full_text[start:end]
+        if len(section) > max_section_chars:
+            logger.warning(
+                "Located section ({:,} chars) exceeds cap {:,} — truncating",
+                len(section), max_section_chars,
             )
-            section = response.choices[0].message.content or ""
-            logger.info("GPT-4o located eligibility section: {} chars", len(section))
-            return section
-        except Exception as e:
-            logger.warning("⚠ GPT-4o failed to extract eligibility section: {}", e)
-            return ""
+            section = section[:max_section_chars]
+
+        logger.info(
+            "✓ Located eligibility section: {:,} chars (chars {:,}–{:,} of {:,} total)",
+            len(section), start, end, len(full_text),
+        )
+        return section
+
+    def extract_eligibility_section(self, full_pdf_text: str, nct_id: str) -> str:
+        """
+        Locate and return the eligibility criteria section from full PDF text.
+        Uses pure-Python locate_eligibility_section() on the FULL text — no truncation
+        before the search, so the real section is found even in 200-page documents.
+        """
+        logger.info("Locating eligibility section in PDF for {} ({:,} chars)...",
+                    nct_id, len(full_pdf_text))
+        section = self.locate_eligibility_section(full_pdf_text)
+        logger.info("Located eligibility section: {:,} chars", len(section))
+        return section
 
     def merge_criteria(
         self, api_criteria_text: str, pdf_criteria_text: str, nct_id: str
     ) -> str:
-        """Use GPT-4o to merge API and PDF criteria, preferring more specific versions."""
-        from openai import OpenAI
+        """Use Claude Sonnet to merge API and PDF criteria, preferring more specific versions."""
+        from app.services.llm_client import get_claude_client
 
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
         api_len = len(api_criteria_text)
         pdf_len = len(pdf_criteria_text)
         logger.info("Merging API ({} chars) + PDF ({} chars) criteria...", api_len, pdf_len)
 
+        system = (
+            "You are a clinical trial expert. You have two versions of eligibility "
+            "criteria for the same trial: one from the API summary (shorter) and one from "
+            "the full protocol PDF (more detailed). Merge them into one complete list.\n"
+            "- Keep all criteria from both sources\n"
+            "- Where they overlap, keep the MORE SPECIFIC version (e.g. 'eGFR >= 45 mL/min' "
+            "is more specific than 'no renal impairment')\n"
+            "- Preserve the Inclusion/Exclusion structure\n"
+            "- Return plain text, no markdown"
+        )
+        user = (
+            f"API summary criteria for {nct_id}:\n{api_criteria_text}\n\n"
+            f"---\nFull protocol PDF criteria:\n{pdf_criteria_text}"
+        )
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                temperature=0,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a clinical trial expert. You have two versions of eligibility "
-                            "criteria for the same trial: one from the API summary (shorter) and one from "
-                            "the full protocol PDF (more detailed). Merge them into one complete list.\n"
-                            "- Keep all criteria from both sources\n"
-                            "- Where they overlap, keep the MORE SPECIFIC version (e.g. 'eGFR >= 45 mL/min' "
-                            "is more specific than 'no renal impairment')\n"
-                            "- Preserve the Inclusion/Exclusion structure\n"
-                            "- Return plain text, no markdown"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"API summary criteria for {nct_id}:\n{api_criteria_text}\n\n"
-                            f"---\nFull protocol PDF criteria:\n{pdf_criteria_text}"
-                        ),
-                    },
-                ],
-            )
-            merged = response.choices[0].message.content or api_criteria_text
+            merged = get_claude_client().complete(system, user) or api_criteria_text
             merged_len = len(merged)
             delta = merged_len - api_len
             logger.info(
@@ -208,7 +314,7 @@ class PDFProtocolParser:
             )
             return merged
         except Exception as e:
-            logger.warning("⚠ GPT-4o merge failed: {} — returning API text", e)
+            logger.warning("⚠ Claude Sonnet merge failed: {} — returning API text", e)
             return api_criteria_text
 
     def parse_protocol(self, nct_id: str, api_criteria_text: str) -> str:

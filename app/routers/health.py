@@ -1,8 +1,9 @@
 import time
 from fastapi import APIRouter
 from loguru import logger
+from app.config import settings
 from app.services.concept_matcher import snomed_matcher
-from app.services.ner_service import ner_service
+from app.services.ner_service import get_ner_service
 
 router = APIRouter(tags=["health"])
 
@@ -12,52 +13,89 @@ async def root():
     return {"status": "healthy", "version": "1.0.0"}
 
 
+def _llm_status() -> dict:
+    key = settings.ANTHROPIC_API_KEY or ""
+    configured = bool(key) and key != "sk-ant-your-key-here"
+    return {
+        "provider": "anthropic",
+        "model": settings.ANTHROPIC_MODEL,
+        "reachable": configured,
+        "configured": configured,
+    }
+
+
+def _langchain_status() -> dict:
+    try:
+        import langchain_anthropic  # noqa: F401
+        import langchain  # noqa: F401
+        available = True
+    except Exception:
+        available = False
+    key = settings.ANTHROPIC_API_KEY or ""
+    initialized = available and bool(key) and key != "sk-ant-your-key-here"
+    return {"initialized": initialized, "available": available, "tools": 4}
+
+
 @router.get("/api/health")
 async def health_check():
-    # FAISS / SNOMED index info
+    # ── Concept matcher / OMOP ────────────────────────────────────────────────
     matcher_status = snomed_matcher.get_status()
-    faiss_info = (
-        f"{len(snomed_matcher._embeddings)} concepts indexed"
-        if snomed_matcher._embeddings is not None
-        else "not built"
-    )
+    try:
+        from app.services.omop_vocabulary import get_omop
+        omop_status = get_omop().get_status()
+    except Exception as e:
+        omop_status = {"omop_available": False, "hierarchy_edges": 0, "reason": str(e)}
 
-    # Synthea availability
+    # ── FAISS index ───────────────────────────────────────────────────────────
+    faiss_built = snomed_matcher._embeddings is not None
+    faiss_size = len(snomed_matcher._embeddings) if faiss_built else 0
+
+    # ── scispaCy NER ──────────────────────────────────────────────────────────
+    ner_status = get_ner_service().get_status()
+
+    # ── Synthea ───────────────────────────────────────────────────────────────
     try:
         from app.services.synthea_runner import synthea_runner
-        synthea_prereqs = synthea_runner.check_prerequisites()
+        prereqs = synthea_runner.check_prerequisites()
         synthea_info = {
-            "available": synthea_prereqs["can_run"],
-            "reason": synthea_prereqs["reason"],
+            "available": prereqs["can_run"],
+            "java_version": prereqs.get("java_version"),
+            "reason": prereqs["reason"],
             "setup_guide": "backend/synthea/SETUP.md",
-            "java_version": synthea_prereqs.get("java_version"),
         }
     except Exception as e:
         synthea_info = {"available": False, "reason": str(e), "setup_guide": "backend/synthea/SETUP.md"}
 
-    # OMOP info (from concept matcher status)
-    omop_info = {
-        "mode": matcher_status["mode"],
-        "concept_count": matcher_status["concept_count"],
-        "omop_available": matcher_status["omop_available"],
-        "omop_reason": (
-            "OMOP vocabulary loaded" if matcher_status["omop_available"]
-            else "Files not found at backend/omop/ — using 80-concept fallback"
-        ),
+    components = {
+        "database": "connected",
+        "llm": _llm_status(),
+        "scispacy": {
+            "loaded": ner_status["loaded"],
+            "model": ner_status["model"],
+            "is_scispacy": ner_status["is_scispacy"],
+            "setup_guide": "backend/README.md",
+        },
+        "langchain_agent": _langchain_status(),
+        "concept_matcher": {
+            "mode": matcher_status["mode"],
+            "concept_count": matcher_status["concept_count"],
+            "hierarchy_active": matcher_status.get("hierarchy_active", False),
+        },
+        "omop": {
+            "available": omop_status.get("omop_available", False),
+            "hierarchy_edges": omop_status.get("hierarchy_edges", 0),
+            "concept_count": omop_status.get("concept_count", 0),
+            "setup_guide": "backend/omop/SETUP.md",
+        },
+        "synthea": synthea_info,
+        "faiss_index": {"built": faiss_built, "size": faiss_size},
     }
 
     status = {
         "status": "healthy",
         "version": "1.0.0",
         "timestamp": time.time(),
-        "components": {
-            "database": "connected",
-            "faiss_index": faiss_info,
-            "spacy_model": ner_service._model_name or "not loaded",
-            "openai": "configured",
-            "concept_matcher": omop_info,
-            "synthea": synthea_info,
-        },
+        "components": components,
     }
     logger.info("Health check requested — status: {}", status["status"])
     return status

@@ -32,9 +32,10 @@ class AccuracyReportGenerator:
 
         # Failure mode rows
         fm_rows = ""
-        for mode, acc in metrics.failure_mode_accuracy.items():
-            acc_pct_fm = round(acc * 100, 1)
-            bar_color = "#22c55e" if acc >= 0.85 else ("#f59e0b" if acc >= 0.70 else "#ef4444")
+        for mode, stats in metrics.failure_mode_accuracy.items():
+            acc_val    = stats["accuracy"] if isinstance(stats, dict) else stats
+            acc_pct_fm = round(acc_val * 100, 1)
+            bar_color  = "#22c55e" if acc_val >= 0.85 else ("#f59e0b" if acc_val >= 0.70 else "#ef4444")
             mode_label = mode.replace("_", " ").title()
             fm_rows += f"""
             <tr>
@@ -46,27 +47,39 @@ class AccuracyReportGenerator:
         cov_pct = round(metrics.confidence_coverage * 100, 1)
         br_pct  = round(metrics.borderline_review_rate * 100, 1)
 
+        fp_total = metrics.false_positives_hard + metrics.false_positives_soft
+
         # Clinical interpretation
         interpretation = (
             f"The screener correctly identified {metrics.true_positives} of "
             f"{metrics.eligible_count} truly eligible patients "
             f"(sensitivity {sens_pct}%, {'exceeding' if metrics.meets_sensitivity_target else 'below'} "
             f"the {round(metrics.target_sensitivity * 100)}% target). "
-            f"It incorrectly flagged {metrics.false_positives} ineligible patients as eligible "
-            f"(false positive rate {round(100 * metrics.false_positives / max(metrics.ineligible_count,1), 1)}%) "
-            f"— these should be caught in manual coordinator review. "
-            f"{metrics.false_negatives} truly eligible patients were missed "
-            f"(false negative rate {round(100 * metrics.false_negatives / max(metrics.eligible_count,1), 1)}%) "
-            f"— these represent lost enrollment opportunities."
+            f"Note: under the clinical workflow definition used here, patients flagged as "
+            f"REVIEW NEEDED are counted as correctly identified — a site coordinator reviews "
+            f"these cases and enrolls truly eligible patients. Only patients incorrectly "
+            f"predicted as INELIGIBLE are counted as misses (false negatives). "
+            f"The screener produced {metrics.false_negatives} false negatives — truly eligible "
+            f"patients predicted INELIGIBLE. These represent the highest-risk errors as they "
+            f"would cause eligible patients to be excluded without coordinator review. "
+            f"{metrics.false_positives_hard} hard false positives (predicted ELIGIBLE, truly not) "
+            f"and {metrics.false_positives_soft} soft false positives (predicted REVIEW NEEDED, truly not — "
+            f"coordinator review catches these) were also detected."
         )
 
         # Recommendations
         recs_html = "<ul style='color:#94a3b8;margin:0;padding-left:20px'>"
         if not metrics.meets_sensitivity_target:
             recs_html += "<li>Sensitivity below target — review HbA1c and eGFR lab alias matching</li>"
-        if metrics.false_positives > 0:
-            recs_html += f"<li>{metrics.false_positives} false positives detected — verify exclusion criterion detection (insulin, malignancy)</li>"
-        low_mode_accs = [(m, a) for m, a in metrics.failure_mode_accuracy.items() if a < 0.80]
+        if metrics.false_positives_hard > 0:
+            recs_html += f"<li>{metrics.false_positives_hard} hard false positives detected — verify exclusion criterion detection (insulin, malignancy)</li>"
+        if metrics.false_positives_soft > 0:
+            recs_html += f"<li>{metrics.false_positives_soft} soft false positives (REVIEW_NEEDED for truly ineligible) — acceptable; coordinator will catch these</li>"
+        low_mode_accs = [
+            (m, s["accuracy"] if isinstance(s, dict) else s)
+            for m, s in metrics.failure_mode_accuracy.items()
+            if (s["accuracy"] if isinstance(s, dict) else s) < 0.80
+        ]
         for mode, acc in low_mode_accs:
             recs_html += f"<li>Failure mode '{mode.replace('_',' ')}' accuracy {round(acc*100,1)}% — investigate concept matching for this criterion</li>"
         if metrics.borderline_review_rate < 0.70:
@@ -159,8 +172,9 @@ class AccuracyReportGenerator:
       </div>
       <div class="cm-header" style="writing-mode:initial">True NOT ELIGIBLE</div>
       <div class="cm-cell cm-fp">
-        <div class="cm-count">{metrics.false_positives}</div>
-        <div class="cm-label">False Positive ← wrong</div>
+        <div class="cm-count">{metrics.false_positives_hard}</div>
+        <div class="cm-label">Hard FP ← coordinator misses</div>
+        <div style="font-size:10px;margin-top:4px;opacity:.7">(+{metrics.false_positives_soft} soft FP → REVIEW)</div>
       </div>
       <div class="cm-cell cm-tn">
         <div class="cm-count">{metrics.true_negatives}</div>

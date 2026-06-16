@@ -110,8 +110,14 @@ class SyntheaRunner:
         count: int,
         seed: int = 42,
         output_dir: str | None = None,
+        module: str | None = "diabetes*",
     ) -> list[dict]:
-        """Run Synthea and return parsed FHIR R4 bundle dicts."""
+        """Run Synthea and return parsed FHIR R4 bundle dicts.
+
+        `module` biases generation toward a Synthea disease module (default
+        "diabetes*" to match the flagship diabetes trial). Pass None for an
+        unbiased general population.
+        """
         prereqs = self.check_prerequisites()
         if not prereqs["can_run"]:
             raise SyntheaNotAvailableError(prereqs["reason"])
@@ -130,15 +136,24 @@ class SyntheaRunner:
             SYNTHEA_JAR_PATH,
             "-p",
             str(count),
+            "--seed",
+            str(seed),
             "-s",
             str(seed),
             "--exporter.fhir.export=true",
             "--exporter.fhir.transaction_bundle=false",
             f"--exporter.baseDirectory={output_dir}",
-            "Massachusetts",
         ]
+        if module:
+            cmd += ["-m", module]
+        cmd.append("Massachusetts")
 
-        logger.info("Running Synthea: count={} seed={} output={}", count, seed, output_dir)
+        # Larger populations need more time. ~2s/patient with a 120s floor, 30min ceiling.
+        timeout_s = min(1800, max(120, count * 2))
+        logger.info(
+            "Running Synthea: count={} seed={} module={} output={} (timeout {}s)",
+            count, seed, module, output_dir, timeout_s,
+        )
         logger.debug("Command: {}", " ".join(cmd))
         start = time.time()
 
@@ -147,10 +162,10 @@ class SyntheaRunner:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as e:
-            raise SyntheaGenerationError("Synthea timed out after 300s") from e
+            raise SyntheaGenerationError(f"Synthea timed out after {timeout_s}s") from e
 
         for line in proc.stdout.splitlines():
             logger.info("[SYNTHEA] {}", line)

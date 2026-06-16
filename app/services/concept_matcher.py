@@ -1,9 +1,14 @@
 """
-Unified ConceptMatcher — uses OMOP vocabulary when available,
-falls back to the hardcoded SNOMED list when OMOP files are absent.
+Unified ConceptMatcher — uses the OMOP vocabulary + SNOMED-CT hierarchy when the
+Athena files are present, and falls back to a hardcoded SNOMED list otherwise.
 
-The singleton `snomed_matcher` is kept for backward compatibility with
-all existing callers (scoring_engine, protocols router, health router).
+The singleton `snomed_matcher` is kept for backward compatibility with all existing
+callers (scoring_engine, protocols router, health router). `get_concept_matcher()`
+is the factory used by the LangChain agent.
+
+Matching layers:
+  1. FAISS semantic similarity (sentence-transformers all-MiniLM-L6-v2)
+  2. SNOMED-CT hierarchy expansion via OMOP CONCEPT_ANCESTOR (is-a / subsumes)
 """
 
 import time
@@ -11,7 +16,7 @@ import numpy as np
 from loguru import logger
 from typing import Optional
 
-from app.services.omop_vocabulary import OMOPVocabulary
+from app.services.omop_vocabulary import get_omop
 
 SNOMED_CONCEPTS = [
     {"code": "44054006", "term": "Type 2 diabetes mellitus"},
@@ -88,12 +93,11 @@ SNOMED_CONCEPTS = [
     {"code": "161665007", "term": "Kidney transplant"},
 ]
 
+# Cap on how many OMOP concepts to embed into FAISS (memory / startup time).
+OMOP_FAISS_CAP = 200_000
+
 
 class ConceptMatcher:
-    """
-    Unified concept matcher: uses OMOP when available, FAISS+SNOMED fallback otherwise.
-    Exposes find_best_match() and build_index() for backward compatibility.
-    """
     _instance: Optional["ConceptMatcher"] = None
 
     def __new__(cls):
@@ -102,28 +106,32 @@ class ConceptMatcher:
             cls._instance._index = None
             cls._instance._model = None
             cls._instance._embeddings = None
+            cls._instance._index_concepts: list[dict] = []
             cls._instance._omop = None
             cls._instance._using_omop = False
         return cls._instance
 
+    # ── OMOP init ────────────────────────────────────────────────────────────
     def _init_omop(self):
         if self._omop is not None:
             return
-        self._omop = OMOPVocabulary()
-        status = self._omop.check_files()
-        if status["omop_available"]:
+        self._omop = get_omop()
+        if self._omop.status["omop_available"]:
             try:
                 self._omop.load()
                 self._using_omop = True
-                n = self._omop.get_concept_count() or 0
-                logger.info("✓ ConceptMatcher using OMOP vocabulary ({} concepts)", n)
+                logger.info(
+                    "✓ ConceptMatcher using OMOP vocabulary ({} concepts, hierarchy={})",
+                    self._omop.get_concept_count() or 0,
+                    self._omop.status["hierarchy_available"],
+                )
             except Exception as e:
                 logger.warning("⚠ OMOP load failed: {} — falling back to SNOMED FAISS", e)
                 self._using_omop = False
         else:
             logger.warning(
-                "ConceptMatcher using hardcoded SNOMED fallback (80 concepts): {}",
-                status["reason"]
+                "ConceptMatcher using hardcoded SNOMED fallback ({} concepts): {}",
+                len(SNOMED_CONCEPTS), self._omop.status["reason"],
             )
             self._using_omop = False
 
@@ -134,41 +142,55 @@ class ConceptMatcher:
             self._model = SentenceTransformer("all-MiniLM-L6-v2")
         return self._model
 
+    # ── Index build ──────────────────────────────────────────────────────────
     def build_index(self):
-        """Build FAISS index. Also initializes OMOP if files are present."""
+        """Build FAISS index from OMOP concepts (if available) or the SNOMED fallback."""
         import faiss
 
         self._init_omop()
 
-        logger.info("Building FAISS SNOMED index with {} concepts...", len(SNOMED_CONCEPTS))
+        if self._using_omop and self._omop:
+            names = self._omop.get_concept_names()[:OMOP_FAISS_CAP]
+            self._index_concepts = [
+                {
+                    "term": n,
+                    "code": str(self._omop.concepts.get(self._omop.name_to_id.get(n.lower(), -1), {}).get("concept_code", "")),
+                    "vocabulary": self._omop.concepts.get(self._omop.name_to_id.get(n.lower(), -1), {}).get("vocabulary_id", "OMOP"),
+                }
+                for n in names
+            ]
+            source = f"OMOP ({len(self._index_concepts)} concepts)"
+        else:
+            self._index_concepts = [
+                {"term": c["term"], "code": c["code"], "vocabulary": "SNOMED"}
+                for c in SNOMED_CONCEPTS
+            ]
+            source = f"SNOMED fallback ({len(self._index_concepts)} concepts)"
+
+        if not self._index_concepts:
+            logger.warning("No concepts available to index — using SNOMED fallback")
+            self._index_concepts = [
+                {"term": c["term"], "code": c["code"], "vocabulary": "SNOMED"}
+                for c in SNOMED_CONCEPTS
+            ]
+            source = f"SNOMED fallback ({len(self._index_concepts)} concepts)"
+
+        logger.info("Building FAISS index from {}...", source)
         start = time.time()
         model = self._get_model()
-        terms = [c["term"] for c in SNOMED_CONCEPTS]
-        self._embeddings = model.encode(terms, normalize_embeddings=True)
+        terms = [c["term"] for c in self._index_concepts]
+        self._embeddings = model.encode(
+            terms, normalize_embeddings=True, show_progress_bar=False
+        )
         dim = self._embeddings.shape[1]
         self._index = faiss.IndexFlatIP(dim)
         self._index.add(np.array(self._embeddings, dtype="float32"))
         elapsed = int((time.time() - start) * 1000)
-        logger.info(
-            "✓ SNOMED index built in {}ms ({} concepts indexed)", elapsed, len(SNOMED_CONCEPTS)
-        )
+        logger.info("✓ FAISS index built in {}ms ({} concepts indexed)",
+                    elapsed, len(self._index_concepts))
 
+    # ── Search ───────────────────────────────────────────────────────────────
     def find_best_match(self, query: str, top_k: int = 3) -> list[dict]:
-        # Try OMOP first
-        if self._using_omop and self._omop:
-            omop_results = self._omop.search(query, top_k)
-            if omop_results:
-                return [
-                    {
-                        "code": r["concept_code"],
-                        "term": r["concept_name"],
-                        "vocabulary": r.get("vocabulary_id", "OMOP"),
-                        "score": r["score"],
-                    }
-                    for r in omop_results
-                ]
-
-        # FAISS fallback
         if self._index is None:
             logger.warning("FAISS index not built — building on-demand")
             self.build_index()
@@ -179,36 +201,74 @@ class ConceptMatcher:
 
         results = []
         for score, idx in zip(scores[0], indices[0]):
-            if idx < 0:
+            if idx < 0 or idx >= len(self._index_concepts):
                 continue
-            concept = SNOMED_CONCEPTS[idx]
+            concept = self._index_concepts[idx]
             results.append(
                 {
                     "code": concept["code"],
                     "term": concept["term"],
+                    "vocabulary": concept.get("vocabulary", "SNOMED"),
                     "score": float(score),
                 }
             )
             logger.debug(
-                "  SNOMED match: '{}' → '{}' (code: {}, score: {:.3f})",
+                "  concept match: '{}' → '{}' (code: {}, score: {:.3f})",
                 query, concept["term"], concept["code"], score,
             )
 
+        # ── SNOMED-CT hierarchy expansion ────────────────────────────────────
+        # If the query has an exact OMOP concept, surface its descendants as
+        # additional valid matches (more-specific terms still satisfy the rule).
+        if self._using_omop and self._omop:
+            descendants = self._omop.get_descendants(query)
+            seen_terms = {r["term"].lower() for r in results}
+            for d in descendants[: max(0, top_k)]:
+                if d.lower() in seen_terms:
+                    continue
+                cid = self._omop.name_to_id.get(d.lower())
+                code = str(self._omop.concepts.get(cid, {}).get("concept_code", "")) if cid else ""
+                results.append(
+                    {"code": code, "term": d, "vocabulary": "SNOMED", "score": 0.99,
+                     "match_type": "hierarchy"}
+                )
+                seen_terms.add(d.lower())
+
         return results
+
+    # ── Hierarchy subsumption ────────────────────────────────────────────────
+    def concept_subsumes(self, rule_concept: str, patient_concept: str) -> bool:
+        """
+        Return True if patient_concept IS-A rule_concept in the SNOMED-CT hierarchy.
+        e.g. concept_subsumes("hypertensive disorder", "essential hypertension") → True
+        Used by the scoring engine so a patient coded with a more-specific diagnosis
+        matches a rule written with the parent (more general) concept.
+        """
+        self._init_omop()
+        if not (self._using_omop and self._omop):
+            return False
+        return self._omop.is_a(patient_concept, rule_concept)
 
     def get_status(self) -> dict:
         self._init_omop()
-        concept_count = (
-            self._omop.get_concept_count()
-            if self._using_omop and self._omop
-            else len(SNOMED_CONCEPTS)
-        )
+        if self._using_omop and self._omop:
+            return {
+                "mode": "omop",
+                "concept_count": self._omop.get_concept_count() or 0,
+                "omop_available": True,
+                "hierarchy_active": self._omop.status["hierarchy_available"],
+            }
         return {
-            "mode": "omop" if self._using_omop else "fallback",
-            "concept_count": concept_count,
-            "omop_available": self._using_omop,
+            "mode": "fallback",
+            "concept_count": len(SNOMED_CONCEPTS),
+            "omop_available": False,
+            "hierarchy_active": False,
         }
 
 
 # Singleton — backward compatible name
 snomed_matcher = ConceptMatcher()
+
+
+def get_concept_matcher() -> ConceptMatcher:
+    return snomed_matcher

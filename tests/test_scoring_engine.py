@@ -113,3 +113,27 @@ class TestScoringEngine:
         patient = make_patient(age=30, labs=[LabResult(name="HbA1c", value=9.0, unit="%")])
         result = scoring_engine.evaluate_patient(patient, rules)
         assert len(result.evaluations) == 3
+
+    def test_hierarchy_match_via_concept_subsumes(self, monkeypatch):
+        """A patient coded with a specific diagnosis should match a rule written
+        with the parent concept via SNOMED-CT hierarchy (concept_subsumes)."""
+        from app.services import scoring_engine as se
+
+        # Patient has the SPECIFIC condition; rule asks for the GENERAL parent.
+        rule = make_rule(1, "Hypertensive disorder", "presence", "", "inclusion")
+        patient = make_patient(age=50, conditions=["Essential hypertension"])
+
+        # Force FAISS expansion off (no weak terms) so only hierarchy can match.
+        monkeypatch.setattr(se.snomed_matcher, "find_best_match", lambda q, top_k=3: [])
+        # Make the hierarchy say essential hypertension IS-A hypertensive disorder.
+        def fake_subsumes(rule_concept, patient_concept):
+            return (rule_concept.lower() == "hypertensive disorder"
+                    and patient_concept.lower() == "essential hypertension")
+        monkeypatch.setattr(se.snomed_matcher, "concept_subsumes", fake_subsumes)
+
+        found, item, score = se.scoring_engine._concept_in_list(
+            "Hypertensive disorder", patient.conditions
+        )
+        assert found is True
+        assert item == "Essential hypertension"
+        assert score == 1.0

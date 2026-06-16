@@ -66,7 +66,11 @@ def test_download_and_extract_text_pdfplumber(parser):
     mock_resp.content = fake_pdf_bytes
 
     mock_page = MagicMock()
-    mock_page.extract_text.return_value = "Inclusion Criteria:\n- Age 18-75\n- HbA1c >= 7.5%"
+    # Must exceed the 100-char threshold or the parser falls through to PyMuPDF.
+    mock_page.extract_text.return_value = (
+        "Inclusion Criteria:\n- Age 18-75 years\n- HbA1c >= 7.5% at screening\n"
+        "- Type 2 diabetes mellitus diagnosis\nExclusion Criteria:\n- Current insulin use\n- Pregnancy"
+    )
     mock_pdf = MagicMock()
     mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
     mock_pdf.__exit__ = MagicMock(return_value=False)
@@ -104,23 +108,31 @@ def test_download_and_extract_text_empty_raises(parser):
                     parser.download_and_extract_text("https://example.com/empty.pdf")
 
 
-# Test 5: merge_criteria combines two texts via mocked GPT-4o
-def test_merge_criteria_mocked_gpt(parser):
+# Test 5: merge_criteria combines two texts via mocked Claude Sonnet
+def test_merge_criteria_mocked_claude(parser):
     api_text = "Inclusion:\n- Age 18-75\nExclusion:\n- Pregnancy"
     pdf_text = "Inclusion:\n- Age 18-75\n- HbA1c >= 7.5%\nExclusion:\n- Pregnancy\n- Active cancer"
 
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = (
+    mock_client = MagicMock()
+    mock_client.complete.return_value = (
         "Inclusion:\n- Age 18-75\n- HbA1c >= 7.5%\nExclusion:\n- Pregnancy\n- Active cancer"
     )
 
-    mock_client = MagicMock()
-    mock_client.chat.completions.create.return_value = mock_response
-
-    with patch("app.services.pdf_protocol_parser.OpenAI", return_value=mock_client):
+    with patch("app.services.llm_client.get_claude_client", return_value=mock_client):
         merged = parser.merge_criteria(api_text, pdf_text, "NCT00000001")
 
     assert "HbA1c" in merged
     assert "Active cancer" in merged
     assert len(merged) > len(api_text)
+
+
+# Test 6: extract_eligibility_section via mocked Claude Sonnet
+def test_extract_eligibility_section_mocked_claude(parser):
+    full_text = "Title page...\nInclusion Criteria:\n- Age 18-75\nExclusion Criteria:\n- Pregnancy"
+    mock_client = MagicMock()
+    mock_client.complete.return_value = "Inclusion Criteria:\n- Age 18-75\nExclusion Criteria:\n- Pregnancy"
+
+    with patch("app.services.llm_client.get_claude_client", return_value=mock_client):
+        section = parser.extract_eligibility_section(full_text, "NCT00000002")
+
+    assert "Inclusion Criteria" in section

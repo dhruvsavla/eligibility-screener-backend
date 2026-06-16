@@ -1,5 +1,6 @@
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from typing import List
 from loguru import logger
 from app import database as db
 from app.models.patient import GeneratePatientsRequest, PatientData
@@ -33,9 +34,9 @@ async def _parse_patient_from_db(row: dict) -> dict:
 @router.get("")
 async def list_patients(skip: int = 0, limit: int = 20):
     rows = await db.fetch_all(
-        """SELECT id, patient_id, name, age, gender, created_at
+        """SELECT id, patient_id, name, age, gender, created_at,
+                  is_ground_truth, ground_truth_verdict
            FROM patients
-           WHERE is_ground_truth IS NULL OR is_ground_truth = 0
            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
         (limit, skip),
     )
@@ -45,9 +46,7 @@ async def list_patients(skip: int = 0, limit: int = 20):
 
 @router.get("/count")
 async def count_patients():
-    row = await db.fetch_one(
-        "SELECT COUNT(*) as total FROM patients WHERE is_ground_truth IS NULL OR is_ground_truth = 0"
-    )
+    row = await db.fetch_one("SELECT COUNT(*) as total FROM patients")
     return {"total": row["total"] if row else 0}
 
 
@@ -133,6 +132,65 @@ async def generate_patients(request: GeneratePatientsRequest):
     }
 
 
+@router.post("/generate-500")
+async def generate_500_patients():
+    """Generate the canonical 500 synthetic patients via the real MITRE Synthea tool.
+
+    This endpoint REQUIRES real Synthea — it does NOT fall back to the Python
+    generator. If Synthea/Java is unavailable it returns HTTP 503 with setup
+    instructions, per the spec (the 500-patient cohort must be real Synthea output).
+    """
+    from app.services.synthea_runner import (
+        synthea_runner,
+        SyntheaNotAvailableError,
+        SyntheaGenerationError,
+    )
+
+    prereqs = synthea_runner.check_prerequisites()
+    if not prereqs["can_run"]:
+        logger.warning("generate-500 requested but Synthea unavailable: {}", prereqs["reason"])
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Synthea not available",
+                "reason": prereqs["reason"],
+                "setup_guide": "backend/synthea/SETUP.md",
+                "instructions": synthea_runner.get_setup_instructions(),
+            },
+        )
+
+    logger.info("=== GENERATING CANONICAL 500 PATIENTS VIA SYNTHEA ===")
+    try:
+        bundles = synthea_runner.generate(count=500, seed=42, module="diabetes*")
+    except (SyntheaNotAvailableError, SyntheaGenerationError) as e:
+        logger.error("Synthea generation failed: {}", e)
+        raise HTTPException(status_code=503, detail={"error": "Synthea generation failed", "reason": str(e)})
+
+    generated = 0
+    failed: list[dict] = []
+    for i, bundle in enumerate(bundles):
+        try:
+            parsed = fhir_parser.parse_bundle(bundle)
+            existing = await db.fetch_one(
+                "SELECT id FROM patients WHERE patient_id = ?", (parsed.patient_id,)
+            )
+            if existing:
+                continue
+            await db.execute(
+                "INSERT INTO patients (patient_id, name, age, gender, fhir_json) VALUES (?,?,?,?,?)",
+                (parsed.patient_id, parsed.name, parsed.age, parsed.gender, json.dumps(bundle)),
+            )
+            generated += 1
+            if generated % 50 == 0:
+                logger.info("[generate-500] inserted {} patients...", generated)
+        except Exception as e:
+            failed.append({"index": i, "error": str(e)})
+            logger.error("Failed to save Synthea patient #{}: {}", i, e)
+
+    logger.info("✓ generate-500 complete: {} inserted, {} failed", generated, len(failed))
+    return {"generated": generated, "source": "synthea", "failed": failed}
+
+
 @router.post("/upload")
 async def upload_patient(bundle: dict):
     logger.info("Uploading FHIR bundle...")
@@ -154,6 +212,53 @@ async def upload_patient(bundle: dict):
     )
     logger.info("✓ Uploaded patient {} (DB id={})", parsed.patient_id, pid)
     return {"id": pid, "patient_id": parsed.patient_id, "name": parsed.name}
+
+
+@router.post("/upload-bulk")
+async def upload_patients_bulk(files: List[UploadFile] = File(...)):
+    """Upload a folder of FHIR R4 bundle JSON files. Returns import summary."""
+    imported, skipped, failed = 0, 0, 0
+    errors: list[dict] = []
+
+    for uf in files:
+        fname = uf.filename or "unknown"
+        if not fname.lower().endswith(".json"):
+            skipped += 1
+            continue
+        try:
+            raw = await uf.read()
+            bundle = json.loads(raw)
+        except Exception as e:
+            failed += 1
+            errors.append({"file": fname, "error": f"Invalid JSON: {e}"})
+            continue
+
+        try:
+            parsed = fhir_parser.parse_bundle(bundle)
+        except Exception as e:
+            failed += 1
+            errors.append({"file": fname, "error": f"Invalid FHIR bundle: {e}"})
+            continue
+
+        existing = await db.fetch_one(
+            "SELECT id FROM patients WHERE patient_id = ?", (parsed.patient_id,)
+        )
+        if existing:
+            skipped += 1
+            continue
+
+        try:
+            await db.execute(
+                "INSERT INTO patients (patient_id, name, age, gender, fhir_json) VALUES (?,?,?,?,?)",
+                (parsed.patient_id, parsed.name, parsed.age, parsed.gender, json.dumps(bundle)),
+            )
+            imported += 1
+        except Exception as e:
+            failed += 1
+            errors.append({"file": fname, "error": f"DB error: {e}"})
+
+    logger.info("Bulk upload: imported={} skipped={} failed={}", imported, skipped, failed)
+    return {"imported": imported, "skipped": skipped, "failed": failed, "errors": errors}
 
 
 @router.delete("/{patient_id}")

@@ -22,17 +22,21 @@ curl -L -o synthea.jar \
 java -jar backend/synthea/synthea.jar --help
 ```
 
-## First run (generates 10 patients in Massachusetts with diabetes focus)
+## Generate the canonical 500 patients
 
-```bash
-java -jar backend/synthea/synthea.jar \
-  -p 10 --seed 42 \
-  --exporter.fhir.export=true \
-  -m diabetes \
-  Massachusetts
+Via API (this is the spec's canonical cohort — requires real Synthea, returns 503 if unavailable):
+```
+POST /api/patients/generate-500
 ```
 
-Output FHIR R4 bundles appear in: `backend/synthea/output/fhir/`
+Or directly:
+```bash
+java -jar backend/synthea/synthea.jar -p 500 --seed 42 \
+  --exporter.fhir.export=true -m diabetes* Massachusetts
+```
+
+Output FHIR R4 bundles appear in: `backend/synthea/output/fhir/` (one bundle per patient).
+First run downloads modules (~30s).
 
 ## Notes
 

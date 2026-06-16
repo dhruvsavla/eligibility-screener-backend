@@ -1,68 +1,63 @@
-# Setting Up OMOP Vocabulary (Athena)
+# OMOP Vocabulary Setup (Athena)
 
-The OMOP vocabulary gives the eligibility screener access to 5M+ standardized
-medical concepts across SNOMED, LOINC, RxNorm, and ICD-10.
+The screener uses the OMOP vocabulary for SNOMED-CT concept matching AND hierarchy
+traversal (so specific patient diagnoses match general protocol criteria).
 
-Without OMOP: the app uses a hardcoded list of 80 SNOMED concepts (works for demos).
-With OMOP: concept matching covers the full clinical vocabulary.
+Without OMOP: the app uses a hardcoded list of 72 SNOMED concepts (works for demos),
+and hierarchy traversal is disabled.
+With OMOP: concept matching covers the full clinical vocabulary, and the SNOMED-CT
+parent/child hierarchy lets a patient coded "essential hypertension" match a rule
+written for "hypertensive disorder".
 
-## Download Steps
-
+## Download
 1. Create a free account at https://athena.ohdsi.org
-2. Click **Download** in the top navigation
-3. Select these vocabulary IDs:
-   - **1**  — SNOMED CT
-   - **17** — RxNorm
-   - **21** — LOINC
-   - **34** — ICD10CM
-4. Click **Download Vocabularies** — you will receive an email with a download link
-5. Unzip the downloaded archive
+2. Click "Download" → select vocabularies:
+   - 1 (SNOMED) — required, includes the concept hierarchy
+   - 17 (RxNorm) — drug concepts
+   - 21 (LOINC) — lab concepts
+3. Submit. You receive an email with a download link (can take minutes to hours).
+4. Unzip the archive.
 
 ## Install
-
 ```bash
 mkdir -p backend/omop
-
-# Copy these files from the unzipped archive:
 cp /path/to/download/CONCEPT.csv backend/omop/
-cp /path/to/download/CONCEPT_SYNONYM.csv backend/omop/
-cp /path/to/download/CONCEPT_RELATIONSHIP.csv backend/omop/   # optional but recommended
+cp /path/to/download/CONCEPT_ANCESTOR.csv backend/omop/   # REQUIRED for hierarchy
+cp /path/to/download/CONCEPT_SYNONYM.csv backend/omop/    # optional
 ```
 
 ## Verify
-
 ```bash
-wc -l backend/omop/CONCEPT.csv
-# Should show ~5-6 million rows
+wc -l backend/omop/CONCEPT.csv          # ~5-6 million rows
+wc -l backend/omop/CONCEPT_ANCESTOR.csv # tens of millions of rows
 ```
 
-## Restart Backend
+CONCEPT_ANCESTOR.csv is large but essential — it encodes the SNOMED-CT hierarchy
+(parent/child relationships). Without it, hierarchy traversal is disabled and the
+matcher falls back to flat semantic matching.
 
+## Restart Backend
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --port 8000
 ```
 
 On startup you will see:
 ```
-INFO  | === OMOP VOCABULARY CHECK ===
-INFO  | CONCEPT.csv: ✓ found (498.2 MB)
-INFO  | ✓ Loaded 200000 OMOP standard concepts (...)
+INFO  | === OMOP VOCABULARY CHECK (backend/omop) ===
+INFO  |   CONCEPT.csv: ✓ found (498.2 MB)
+INFO  |   CONCEPT_ANCESTOR.csv: ✓ found (1203.4 MB)
+INFO  | ✓ Loaded 200000 OMOP standard concepts
+INFO  | ✓ Loaded N hierarchy edges (M concepts have ancestors)
 ```
 
+Confirm via the health endpoint:
+`GET /api/health` → `components.omop.available` and `components.concept_matcher.hierarchy_active`.
+
 ## Notes
-
-- Files are large: CONCEPT.csv ~500 MB, total ~2 GB unzipped
-- The app loads a filtered subset into memory (~200K standard concepts, ~500 MB RAM)
+- Files are large: CONCEPT.csv ~500 MB, CONCEPT_ANCESTOR.csv ~1 GB+
+- The app loads a filtered subset into memory (up to 200K standard concepts)
 - Loading takes ~15-30 seconds on first startup; the index is held in memory
-- Without these files, the app uses the built-in 80-concept SNOMED fallback
-- The fallback is visible in the health endpoint:
-  `GET /api/health` → `components.concept_matcher.mode`
 
-## What OMOP Improves
-
-| Scenario                         | Without OMOP           | With OMOP                     |
-|----------------------------------|------------------------|-------------------------------|
-| "Glomerulonephritis" concept     | No match               | SNOMED 36171008               |
-| "Imatinib" drug match            | No match               | RxNorm 282388                 |
-| LOINC lab code resolution        | ~18 common labs        | Full LOINC (~90K entries)     |
-| ICD-10 → SNOMED bridging         | Manual only            | CONCEPT_RELATIONSHIP mapping  |
+## Without OMOP
+The app uses a 72-concept hardcoded SNOMED fallback. Hierarchy traversal is
+unavailable in fallback mode. The system still functions for demos.

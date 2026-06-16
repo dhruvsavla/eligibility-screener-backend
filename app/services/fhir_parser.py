@@ -43,9 +43,36 @@ def _calc_age(birth_date_str: str) -> int | None:
         return None
 
 
+KNOWN_LOINC_CODES = {
+    "4548-4", "17856-6", "59261-8", "41995-2",       # HbA1c
+    "33914-3", "62238-1", "98979-8", "48642-3", "48643-1",  # eGFR
+    "2160-0", "38483-4", "14682-9", "59826-8",        # Creatinine
+    "718-7", "59260-0", "20509-6",                    # Hemoglobin
+    "6690-2", "49498-9", "26464-8",                   # WBC
+    "777-3", "26515-7", "74775-1",                    # Platelets
+    "1742-6", "1743-4", "76625-3",                    # ALT
+    "1920-8", "1921-6",                               # AST
+    "1975-2", "14629-0", "59828-4",                   # Bilirubin
+    "2345-7", "14749-6", "2339-0",                    # Glucose
+    "2951-2", "2947-0", "39791-9",                    # Sodium
+    "2823-3", "6298-4", "39789-3",                    # Potassium
+    "2093-3", "35200-5", "14647-2",                   # Cholesterol
+    "13457-7", "18262-6", "2089-1",                   # LDL
+    "2085-9", "14646-4",                              # HDL
+    "2571-8", "12951-0",                              # Triglycerides
+    "39156-5", "59574-4",                             # BMI
+    "8480-6", "76534-7",                              # Systolic BP
+    "8462-4", "76535-4",                              # Diastolic BP
+}
+
+
 def _is_relevant_lab(display: str) -> bool:
     d = display.lower()
     return any(pat in d for pat in RELEVANT_LAB_PATTERNS)
+
+
+def _is_known_loinc(loinc_code: str | None) -> bool:
+    return bool(loinc_code and loinc_code in KNOWN_LOINC_CODES)
 
 
 class FHIRParser:
@@ -121,7 +148,13 @@ class FHIRParser:
                     or (code_obj.get("coding", [{}])[0].get("display") if code_obj.get("coding") else None)
                     or ""
                 )
-                if not _is_relevant_lab(display):
+                # Extract LOINC code from coding array
+                loinc_code = None
+                for coding in code_obj.get("coding", []):
+                    if "loinc.org" in coding.get("system", ""):
+                        loinc_code = coding.get("code")
+                        break
+                if not _is_relevant_lab(display) and not _is_known_loinc(loinc_code):
                     continue
                 vq = res.get("valueQuantity", {})
                 if vq and "value" in vq:
@@ -132,6 +165,7 @@ class FHIRParser:
                                 value=float(vq["value"]),
                                 unit=vq.get("unit", ""),
                                 date=res.get("effectiveDateTime", "")[:10] if res.get("effectiveDateTime") else "",
+                                loinc_code=loinc_code,
                             )
                         )
                     except Exception:

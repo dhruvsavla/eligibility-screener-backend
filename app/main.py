@@ -37,7 +37,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Automated Eligibility Screener API",
-    description="Clinical trial eligibility screening using GPT-4o, FHIR R4, and SNOMED CT",
+    description="Clinical trial eligibility screening using Claude Sonnet, scispaCy, "
+                "LangChain, FHIR R4, OMOP/SNOMED-CT, and Synthea",
     version="1.0.0",
     lifespan=lifespan,
 )

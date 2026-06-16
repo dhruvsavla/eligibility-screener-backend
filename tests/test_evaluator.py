@@ -188,3 +188,66 @@ def test_export_annotated_csv(ev):
         assert col in header, f"Missing column: {col}"
 
     assert len(lines) == 101  # header + 100 patients
+
+
+# Test 9: derive_thresholds reads age/HbA1c/eGFR from real flagship rules
+def test_derive_thresholds_from_rules():
+    from app.services.evaluator import derive_thresholds, _make_rule
+    rules = [
+        _make_rule(1, "Age", "between", "21 70", "inclusion"),
+        _make_rule(2, "HbA1c", "between", "8.0 12.0", "inclusion"),
+        _make_rule(3, "eGFR", ">=", "50", "inclusion"),
+        _make_rule(4, "eGFR", "<", "30", "exclusion"),
+    ]
+    thr = derive_thresholds(rules)
+    assert thr["derived"] is True
+    assert thr["age_lo"] == 21 and thr["age_hi"] == 70
+    assert thr["hba1c_lo"] == 8.0 and thr["hba1c_hi"] == 12.0
+    assert thr["egfr_incl_min"] == 50
+    assert thr["egfr_excl_max"] == 30
+
+
+# Test 10: derive_thresholds falls back to reference values when nothing recognizable
+def test_derive_thresholds_fallback():
+    from app.services.evaluator import derive_thresholds, _make_rule
+    rules = [_make_rule(1, "Pregnancy", "absence", "", "exclusion")]
+    thr = derive_thresholds(rules)
+    assert thr["derived"] is False
+    assert thr["age_lo"] == 18.0 and thr["age_hi"] == 75.0  # reference defaults
+
+
+# Test 11: ground truth built from flagship rules uses those thresholds
+def test_ground_truth_flagship_aware(ev):
+    from app.services.evaluator import _make_rule
+    rules = [
+        _make_rule(1, "Age", "between", "40 60", "inclusion"),
+        _make_rule(2, "HbA1c", "between", "8.0 11.0", "inclusion"),
+        _make_rule(3, "eGFR", ">=", "70", "inclusion"),
+        _make_rule(4, "eGFR", "<", "40", "exclusion"),
+    ]
+    patients = ev.build_ground_truth_set(protocol_id=1, rules=rules)
+    assert len(patients) == 100
+    # eligible patients should reference the derived thresholds in their reason
+    eligible = [p for p in patients if p.ground_truth_verdict == "ELIGIBLE"]
+    assert any("8.0-11.0" in p.ground_truth_reason for p in eligible)
+
+
+# Test 12: Option B — REVIEW_NEEDED for a truly eligible patient counts as TP
+def test_option_b_review_counts_as_tp(ev):
+    pairs = [
+        EvaluationPair(
+            patient_id="GT-001", ground_truth_verdict="ELIGIBLE",
+            predicted_verdict="REVIEW_NEEDED", predicted_score=70,
+            confidence_low=55, confidence_high=80, correct=True,
+        ),
+        EvaluationPair(
+            patient_id="GT-002", ground_truth_verdict="ELIGIBLE",
+            predicted_verdict="ELIGIBLE", predicted_score=90,
+            confidence_low=80, confidence_high=95, correct=True,
+        ),
+    ]
+    metrics = ev.compute_metrics(pairs)
+    # both eligible patients counted as TP (one ELIGIBLE, one REVIEW_NEEDED)
+    assert metrics.true_positives == 2
+    assert metrics.false_negatives == 0
+    assert metrics.sensitivity == 1.0

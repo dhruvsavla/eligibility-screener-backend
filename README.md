@@ -1,17 +1,22 @@
 # Automated Eligibility Screener — Backend
 
-FastAPI backend for automated clinical trial eligibility screening. Fetches trials from ClinicalTrials.gov, extracts structured criteria via GPT-4o, parses FHIR R4 patient bundles, and scores each patient against trial criteria using a SNOMED CT–indexed semantic matching engine.
+FastAPI backend for automated clinical trial eligibility screening. Fetches trials
+from ClinicalTrials.gov, extracts structured criteria via a **LangChain document
+agent** powered by **Claude Sonnet** (with **scispaCy** clinical NER), parses FHIR R4
+patient bundles, and scores each patient against trial criteria using an
+**OMOP/SNOMED-CT**–indexed semantic matching engine with hierarchy traversal.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
 | API framework | FastAPI + Uvicorn |
-| LLM | OpenAI GPT-4o (criteria extraction + rationale) |
-| NLP | scispaCy / spaCy NER |
+| LLM | Anthropic **Claude Sonnet** (`claude-sonnet-4-6`) — criteria extraction + rationale |
+| Agent | **LangChain** document agent (`langchain-anthropic`, 4 tools) |
+| Clinical NER | **scispaCy** (`en_core_sci_sm`, fallback `en_core_web_sm`) |
 | Semantic search | FAISS + sentence-transformers (all-MiniLM-L6-v2) |
-| Patient data | FHIR R4 Bundle (synthetic generator included) |
-| Ontology | SNOMED CT (72 indexed concepts), LOINC, RxNorm |
+| Vocabulary | **OMOP** (Athena) with **SNOMED-CT hierarchy** (CONCEPT_ANCESTOR), LOINC, RxNorm |
+| Patient data | **Synthea** (MITRE) real FHIR R4 + Python fallback |
 | Database | SQLite via aiosqlite |
 | Runtime | Python 3.11+ |
 
@@ -25,31 +30,67 @@ source venv/bin/activate        # Windows: venv\Scripts\activate
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Install spaCy model
-#    Try the medical model first; fall back to the general one if the URL is unavailable
-pip install https://s3-us-west-2.amazonaws.com/ai2-s3-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz \
-  || python -m spacy download en_core_web_sm
+# 3. Install scispaCy clinical NER model (required for clinical entity recognition)
+pip install https://s3-us-west-2.amazonaws.com/ai2-s3-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
+#    Fallback if the above fails:
+python -m spacy download en_core_web_sm
 
 # 4. Configure environment
 cp .env.example .env
-# Open .env and set your OPENAI_API_KEY
+# Open .env and set your ANTHROPIC_API_KEY
 
-# 5. Start the server
+# 5. (Optional but recommended) Download Synthea + OMOP — see SETUP.md files below
+
+# 6. Start the server
 uvicorn app.main:app --reload --port 8000
 ```
 
 API docs: `http://localhost:8000/docs`
 
+## Required Tools & Setup Guides
+
+| Tool | Purpose | Required | Guide |
+|---|---|---|---|
+| Anthropic API key | Claude Sonnet LLM | **Yes** | set `ANTHROPIC_API_KEY` in `.env` |
+| scispaCy model | clinical NER | Yes (falls back to en_core_web_sm) | command above |
+| Synthea JAR + Java 11+ | 500 real patients | for `/generate-500` | [synthea/SETUP.md](synthea/SETUP.md) |
+| OMOP CONCEPT.csv + CONCEPT_ANCESTOR.csv | SNOMED hierarchy | for hierarchy matching | [omop/SETUP.md](omop/SETUP.md) |
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `OPENAI_API_KEY` | **Yes** | — | OpenAI API key (GPT-4o access required) |
+| `ANTHROPIC_API_KEY` | **Yes** | — | Anthropic API key (Claude Sonnet access) |
+| `ANTHROPIC_MODEL` | No | `claude-sonnet-4-6` | Claude model id |
 | `DATABASE_URL` | No | `sqlite:///./eligibility.db` | SQLite path |
 | `LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `CORS_ORIGINS` | No | `["http://localhost:5173"]` | Allowed CORS origins as JSON array |
+| `SYNTHEA_JAR_PATH` | No | `backend/synthea/synthea.jar` | Path to the Synthea JAR |
+| `OMOP_DIR` | No | `backend/omop` | Directory holding OMOP CSV files |
 
 > **Never commit `.env`** — it is listed in `.gitignore`. Use `.env.example` as the template.
+
+## Two Accuracy Measures
+
+- **Measure 1 — Criteria Extraction Accuracy:** hand-label gold rules on the
+  Annotation page, then `POST /api/protocols/{id}/extraction-accuracy` compares
+  Claude's extraction against the gold standard (precision / recall / F1).
+- **Measure 2 — Screening Sensitivity:** `POST /api/evaluation/build-ground-truth`
+  then `POST /api/evaluation/run` scores 100 ground-truth patients built against the
+  flagship protocol's real thresholds (Option B sensitivity, target ≥85%).
+
+## First-Use Sequence
+
+```
+a. POST /api/protocols/seed-all          # seeds 10 protocols, flags diabetes flagship
+b. Annotation page → flagship → hand-label gold rules → Save
+c. POST /api/protocols/{flagship}/extraction-accuracy   # MEASURE 1
+d. POST /api/patients/generate-500       # real Synthea
+e. POST /api/evaluation/build-ground-truth {protocol_id: flagship}
+f. POST /api/evaluation/run {protocol_id: flagship}      # MEASURE 2
+g. GET  /api/evaluation/report/{flagship}/html
+   Verify all components green: GET /api/health
+```
 
 ## Project Structure
 
@@ -58,37 +99,42 @@ app/
   config.py              # Pydantic settings — reads .env
   database.py            # SQLite schema + async query helpers
   main.py                # FastAPI app, CORS, request logging, lifespan
+  data/seed_protocols.py # 10-protocol seeder + flagship flag
   models/                # Pydantic data models
   routers/
-    health.py
-    patients.py
-    protocols.py
+    health.py            # 8-component system status
+    patients.py          # incl. /generate-500 (real Synthea)
+    protocols.py         # incl. /seed-all, gold annotations, extraction-accuracy
     screening.py
+    evaluation.py
   services/
-    concept_matcher.py       # FAISS SNOMED index builder + searcher
-    criteria_extractor.py    # GPT-4o structured criteria extraction
+    llm_client.py            # shared Claude Sonnet client (all LLM calls route here)
+    langchain_agent.py       # LangChain document agent (4 tools)
+    ner_service.py           # scispaCy clinical NER
+    criteria_extractor.py    # Claude Sonnet structured criteria extraction
+    concept_matcher.py       # OMOP/FAISS matcher + SNOMED-CT hierarchy
+    omop_vocabulary.py       # OMOP loader + is_a() hierarchy traversal
+    extraction_evaluator.py  # Measure 1: extraction precision/recall/F1
+    evaluator.py             # Measure 2: flagship-aware ground truth + metrics
     fhir_parser.py           # FHIR R4 Bundle → PatientData
-    ner_service.py           # scispaCy / spaCy NER
-    rationale_generator.py   # GPT-4o plain-English rationale cards
+    rationale_generator.py   # Claude Sonnet plain-English rationale cards
     scoring_engine.py        # Rule evaluator, ULN resolution, fit scorer
-    synthea_generator.py     # Realistic synthetic FHIR R4 patient generator
+    synthea_runner.py        # Real MITRE Synthea wrapper
+    synthea_generator.py     # Python fallback FHIR R4 generator
     trials_fetcher.py        # ClinicalTrials.gov API v2 client
-tests/
-  test_criteria_extractor.py
-  test_fhir_parser.py
-  test_scoring_engine.py
+tests/                       # pytest suite (75 tests)
 ```
 
 ## Scoring Algorithm
 
 - Base score: **100/100**
-- Confirmed inclusion criterion **FAIL**: −20 pts
-- Confirmed exclusion criterion **triggered**: −25 pts
-- **AMBIGUOUS** (no patient data available): no score penalty — only widens the confidence band
-- Thresholds with `Nx ULN` (e.g. "1.5× ULN") are resolved against standard reference ranges
-- **ELIGIBLE**: score ≥ 75 and <50% ambiguous criteria
-- **REVIEW_NEEDED**: score ≥ 40 but many unverifiable criteria
-- **INELIGIBLE**: any confirmed inclusion FAIL, or score < 40
+- Confirmed inclusion criterion **FAIL**: −20 pts; inclusion **AMBIGUOUS**: −5 pts
+- Exclusion **triggered**: −25 pts; exclusion **AMBIGUOUS**: −3 pts
+- Concept matching: substring **OR** FAISS ≥ 0.72 **OR** SNOMED-CT hierarchy is-a
+- Asymmetric confidence band widens with unverifiable criteria
+- **ELIGIBLE**: score ≥ 80, inclusion pass-rate ≥ 60%, no ambiguous exclusions
+- **REVIEW_NEEDED**: default (counts as TP under Option B sensitivity)
+- **INELIGIBLE**: confirmed inclusion FAIL, exclusion triggered, or score < 30
 
 ## Running Tests
 
@@ -99,6 +145,7 @@ pytest tests/ -v
 ## Requirements
 
 - Python 3.11+
-- OpenAI API key with GPT-4o access
+- Anthropic API key with Claude Sonnet access
+- Java 11+ (for real Synthea)
 - ~2 GB RAM (sentence-transformers + FAISS index)
-- Internet access (ClinicalTrials.gov API + OpenAI)
+- Internet access (ClinicalTrials.gov API + Anthropic API)

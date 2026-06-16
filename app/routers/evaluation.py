@@ -79,14 +79,57 @@ async def build_ground_truth(request: BuildGroundTruthRequest):
         request.protocol_id, proto["title"]
     )
 
-    # Delete existing ground truth for this protocol
-    await db.execute(
-        "DELETE FROM patients WHERE is_ground_truth = 1 AND ground_truth_protocol_id = ?",
-        (request.protocol_id,),
+    # Delete existing ground truth patients — must remove child rows first to
+    # satisfy the FK constraint: screening_results → patients, criterion_evaluations → screening_results
+    gt_patient_ids = await db.fetch_all(
+        "SELECT id FROM patients WHERE is_ground_truth = 1"
     )
+    if gt_patient_ids:
+        id_list = ",".join(str(r["id"]) for r in gt_patient_ids)
+        result_ids = await db.fetch_all(
+            f"SELECT id FROM screening_results WHERE patient_id IN ({id_list})"
+        )
+        if result_ids:
+            rid_list = ",".join(str(r["id"]) for r in result_ids)
+            await db.execute(
+                f"DELETE FROM criterion_evaluations WHERE result_id IN ({rid_list})"
+            )
+        await db.execute(
+            f"DELETE FROM screening_results WHERE patient_id IN ({id_list})"
+        )
+    await db.execute("DELETE FROM patients WHERE is_ground_truth = 1")
 
-    # Generate patients
-    gt_patients = evaluator.build_ground_truth_set(request.protocol_id)
+    # Load the protocol's REAL extracted rules so the ground truth is generated
+    # relative to the flagship protocol's actual thresholds (Measure 2).
+    rule_rows = await db.fetch_all(
+        "SELECT * FROM criterion_rules WHERE protocol_id = ?", (request.protocol_id,)
+    )
+    flagship_rules = None
+    if rule_rows:
+        from app.models.protocol import CriterionRule, CriterionType
+        flagship_rules = [
+            CriterionRule(
+                id=r["id"],
+                protocol_id=r["protocol_id"],
+                criterion_text=r["criterion_text"] or "",
+                concept=r["concept"] or "",
+                operator=r["operator"] or "presence",
+                value=r["value"] or "",
+                required=bool(r["required"]),
+                criterion_type=CriterionType(r["criterion_type"]),
+                snomed_code=r["snomed_code"],
+                confidence=r["confidence"] or 0.0,
+            )
+            for r in rule_rows
+        ]
+    else:
+        logger.warning(
+            "Protocol {} has no criterion rules — ground truth will use reference thresholds",
+            request.protocol_id,
+        )
+
+    # Generate patients (flagship-aware when rules are available)
+    gt_patients = evaluator.build_ground_truth_set(request.protocol_id, rules=flagship_rules)
 
     eligible_count = ineligible_count = borderline_count = 0
     created = 0
@@ -196,7 +239,7 @@ async def run_evaluation(request: RunEvaluationRequest):
 
     logger.info("Running evaluation: {} patients × {} rules", len(gt_patients), len(rules))
     pairs = evaluator.run_evaluation(gt_patients, rules)
-    metrics = evaluator.compute_metrics(pairs)
+    metrics = evaluator.compute_metrics(pairs, protocol_title=proto.get("title", ""))
 
     # Generate reports
     html = report_generator.generate_html_report(
@@ -261,7 +304,7 @@ async def get_html_report(protocol_id: int):
     )
     if not row or not row["html_report"]:
         raise HTTPException(status_code=404, detail="No HTML report found")
-    return HTMLResponse(content=row["html_report"], media_type="text/html")
+    return HTMLResponse(content=row["html_report"], media_type="text/html; charset=utf-8")
 
 
 @router.get("/export/{protocol_id}/csv")
