@@ -867,7 +867,7 @@ class SyntheticPatientGenerator:
 
             birth_year = date.today().year - age
             birth_date = f"{birth_year}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
-            pid = f"PT-{i + 1:04d}"
+            pid = str(uuid.uuid4())
 
             # Conditions
             cond_keys = _select_conditions(profile, age)

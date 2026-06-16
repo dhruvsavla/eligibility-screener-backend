@@ -34,14 +34,14 @@ async def _parse_patient_from_db(row: dict) -> dict:
 @router.get("")
 async def list_patients(skip: int = 0, limit: int = 20):
     rows = await db.fetch_all(
-        """SELECT id, patient_id, name, age, gender, created_at,
+        """SELECT id, patient_id, name, age, gender, fhir_json, created_at,
                   is_ground_truth, ground_truth_verdict
            FROM patients
            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
         (limit, skip),
     )
     logger.info("Listed {} patients (skip={} limit={})", len(rows), skip, limit)
-    return rows
+    return [await _parse_patient_from_db(row) for row in rows]
 
 
 @router.get("/count")

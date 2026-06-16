@@ -130,6 +130,13 @@ class SyntheaRunner:
         os.makedirs(output_dir, exist_ok=True)
         fhir_dir = os.path.join(output_dir, "fhir")
 
+        # Clear stale output so Synthea does a full fresh simulation (not a metadata replay)
+        import shutil
+        for subdir in ("fhir", "metadata"):
+            stale = os.path.join(output_dir, subdir)
+            if os.path.isdir(stale):
+                shutil.rmtree(stale)
+
         cmd = [
             "java",
             "-jar",
@@ -141,7 +148,6 @@ class SyntheaRunner:
             "-s",
             str(seed),
             "--exporter.fhir.export=true",
-            "--exporter.fhir.transaction_bundle=false",
             f"--exporter.baseDirectory={output_dir}",
         ]
         if module:
@@ -188,7 +194,14 @@ class SyntheaRunner:
             try:
                 with open(fpath) as f:
                     bundle = json.load(f)
-                if bundle.get("resourceType") == "Bundle":
+                if bundle.get("resourceType") != "Bundle":
+                    continue
+                # Skip hospital/practitioner info files — keep only patient bundles
+                has_patient = any(
+                    e.get("resource", {}).get("resourceType") == "Patient"
+                    for e in bundle.get("entry", [])
+                )
+                if has_patient:
                     bundles.append(bundle)
             except Exception as e:
                 logger.warning("⚠ Could not load Synthea output {}: {}", fpath, e)

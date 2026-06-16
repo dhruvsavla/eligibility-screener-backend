@@ -129,7 +129,7 @@ async def build_ground_truth(request: BuildGroundTruthRequest):
         )
 
     # Generate patients (flagship-aware when rules are available)
-    gt_patients = evaluator.build_ground_truth_set(request.protocol_id, rules=flagship_rules)
+    gt_patients = evaluator.build_ground_truth_set(request.protocol_id, rules=flagship_rules, count=request.count)
 
     eligible_count = ineligible_count = borderline_count = 0
     created = 0
