@@ -110,7 +110,7 @@ class SyntheaRunner:
         count: int,
         seed: int = 42,
         output_dir: str | None = None,
-        module: str | None = "diabetes*",
+        module: str | None = None,
     ) -> list[dict]:
         """Run Synthea and return parsed FHIR R4 bundle dicts.
 

@@ -6,7 +6,7 @@ from app.models.patient import PatientData, LabResult
 from app.models.protocol import CriterionRule, CriterionType
 from app.models.screening import CriterionEvaluationCreate, EvaluationStatus, VerdictType
 from app.services.concept_matcher import snomed_matcher
-
+from app.services.agentic_fallback import fallback_agent
 # SNOMED similarity thresholds
 SNOMED_THRESHOLD_SIGNAL = 0.72   # >= 0.72 → confirmed match, use as PASS/FAIL
 SNOMED_THRESHOLD_WEAK   = 0.55   # 0.55-0.72 → uncertain → AMBIGUOUS
@@ -636,10 +636,29 @@ class ScoringEngine:
             item       = item_cond or item_med
             best_score = max(score_cond, score_med)
             final      = self._snomed_match_status(best_score, "PASS")
+            
             if final == "PASS":
+                # Ensure we handle list values extracted by the LLM (e.g., ['male', 'female'])
+                # We attempt to safely parse string representations of lists first
+                parsed_value = value
+                if value.strip().startswith("[") and value.strip().endswith("]"):
+                    try:
+                        import ast
+                        parsed_value = ast.literal_eval(value)
+                    except Exception:
+                        pass # Fallback to original string if it fails to parse
+
+                # If the expected value is a list of allowed options
+                if isinstance(parsed_value, list):
+                     # Treat it as a PASS if the found item is broadly matched by any option in the list
+                     # (Since concept_in_list already confirmed presence of the concept itself)
+                     return EvaluationStatus.PASS, f"Found matching record: '{item}' (matches one of allowed options)", item
+
+                # If it's a numeric comparison
                 result = _compare_lab(1.0, operator, value, concept) if _extract_numeric(value) else None
                 if result is None:
                     return EvaluationStatus.PASS, f"Found matching record: '{item}'", item
+                
                 return (
                     EvaluationStatus.PASS if result else EvaluationStatus.FAIL,
                     f"Found '{item}' with value comparison",
@@ -648,7 +667,6 @@ class ScoringEngine:
             return EvaluationStatus.AMBIGUOUS, f"Weak match for '{concept}' — uncertain (score={best_score:.2f})", item
 
         return EvaluationStatus.AMBIGUOUS, f"No data found for '{concept}' in patient record", ""
-
     def evaluate_patient(
         self, patient: PatientData, rules: list[CriterionRule]
     ) -> ScoringResult:
@@ -660,8 +678,31 @@ class ScoringEngine:
         db_evaluations: list[CriterionEvaluationCreate] = []
 
         for rule in rules:
+            # 1. Let the deterministic Python engine try first (The Junior Coordinator)
             raw_status, explanation, data_found = self._evaluate_rule(rule, patient)
 
+            # 2. THE FALLBACK LOOP (The Senior Doctor)
+            # If Python isn't 100% sure, or if it outright failed the patient, ask the LLM to double check.
+            if raw_status in [EvaluationStatus.AMBIGUOUS, EvaluationStatus.FAIL]:
+                
+                # Skip sending simple demographic checks to the LLM to save time
+                if rule.concept.lower() not in ["age", "gender", "sex"]:
+                    try:
+                        new_status, ai_explanation = fallback_agent.verify_evaluation(
+                            rule=rule,
+                            patient=patient,
+                            current_status=raw_status,
+                            python_rationale=explanation
+                        )
+                        
+                        # If Claude disagreed with Python, override the results!
+                        if new_status != raw_status:
+                            raw_status = new_status
+                            explanation = f"✨ [AI Agent Override]: {ai_explanation} (Python originally said: {explanation})"
+                    except Exception as e:
+                        logger.error("Agentic fallback failed for rule {}: {}", rule.concept, e)
+
+            # 3. Determine if rule is inclusion or exclusion
             is_inclusion = (
                 rule.criterion_type == CriterionType.inclusion
                 or (rule.criterion_type != CriterionType.exclusion and rule.required)
