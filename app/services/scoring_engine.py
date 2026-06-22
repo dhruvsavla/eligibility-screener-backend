@@ -1,8 +1,10 @@
 import re
 import json
+import asyncio
+from datetime import date, timedelta
 from loguru import logger
 from dataclasses import dataclass, field
-from app.models.patient import PatientData, LabResult
+from app.models.patient import PatientData, LabResult, ConditionRecord, MedicationRecord
 from app.models.protocol import CriterionRule, CriterionType
 from app.models.screening import CriterionEvaluationCreate, EvaluationStatus, VerdictType
 from app.services.concept_matcher import snomed_matcher
@@ -100,6 +102,79 @@ _ULN: dict[str, float] = {
     "creatinine":   1.2,
 }
 
+_TIMEFRAME_DAYS: dict[str, float] = {
+    "days":   1.0,
+    "day":    1.0,
+    "weeks":  7.0,
+    "week":   7.0,
+    "months": 30.44,
+    "month":  30.44,
+    "years":  365.25,
+    "year":   365.25,
+}
+
+
+def _timeframe_cutoff(timeframe_value: float, timeframe_unit: str) -> date | None:
+    """Return the earliest date that falls within the rule's time window from today.
+
+    A record with onset_date >= cutoff is *within* the window; one before it is outside.
+    Returns None if the timeframe cannot be parsed.
+    """
+    unit_norm = (timeframe_unit or "").lower().strip()
+    days_per_unit = _TIMEFRAME_DAYS.get(unit_norm)
+    if days_per_unit is None:
+        return None
+    delta = timedelta(days=timeframe_value * days_per_unit)
+    return date.today() - delta
+
+
+def _record_within_window(records: list, concept_name_lower: str, cutoff: date) -> bool:
+    """True if any record whose name matches concept_name_lower has an onset_date >= cutoff."""
+    for rec in records:
+        name_lower = rec.name.lower()
+        if concept_name_lower in name_lower or name_lower in concept_name_lower:
+            if rec.onset_date is not None and rec.onset_date >= cutoff:
+                return True
+    return False
+
+
+# Conversion factors: (from_unit, to_unit) → multiply patient value by this factor
+# to convert it into the rule's unit before numeric comparison.
+UNIT_CONVERSION_MAP: dict[tuple[str, str], float] = {
+    ("g/dl", "g/l"):          10.0,
+    ("g/l",  "g/dl"):          0.1,
+    ("mg/dl", "mmol/l"):       0.05551,   # glucose
+    ("mmol/l", "mg/dl"):      18.016,     # glucose
+    ("umol/l", "mg/dl"):       0.01131,   # creatinine
+    ("µmol/l", "mg/dl"):       0.01131,
+    ("mg/dl", "umol/l"):      88.42,      # creatinine
+    ("mg/dl", "µmol/l"):      88.42,
+    ("nmol/l", "pmol/l"):   1000.0,
+    ("pmol/l", "nmol/l"):      0.001,
+}
+
+
+def _normalize_unit(u: str | None) -> str:
+    """Lowercase, strip whitespace and Unicode variants for unit comparison."""
+    if not u:
+        return ""
+    return u.lower().strip().replace("μ", "µ").replace("u/", "u/")
+
+
+def _convert_patient_value(patient_value: float, patient_unit: str | None, rule_unit: str | None) -> float:
+    """Return patient_value converted to rule_unit if a known conversion exists, otherwise as-is."""
+    pu = _normalize_unit(patient_unit)
+    ru = _normalize_unit(rule_unit)
+    if not pu or not ru or pu == ru:
+        return patient_value
+    factor = UNIT_CONVERSION_MAP.get((pu, ru))
+    if factor is not None:
+        logger.debug(
+            "Unit conversion: {} {} → {} (×{})", patient_value, patient_unit, rule_unit, factor
+        )
+        return patient_value * factor
+    return patient_value
+
 
 @dataclass
 class FitScoreData:
@@ -149,7 +224,16 @@ def _resolve_threshold(threshold_str: str, concept: str) -> float | None:
     return _extract_numeric(threshold_str)
 
 
-def _compare_lab(value: float, operator: str, threshold_str: str, concept: str = "") -> bool | None:
+def _compare_lab(
+    value: float,
+    operator: str,
+    threshold_str: str,
+    concept: str = "",
+    patient_unit: str | None = None,
+    rule_unit: str | None = None,
+) -> bool | None:
+    # Normalise patient value into the rule's unit before comparing
+    value = _convert_patient_value(value, patient_unit, rule_unit)
     if operator in ("between", "range"):
         nums = re.findall(r"\d+\.?\d*", threshold_str)
         if len(nums) >= 2:
@@ -534,7 +618,8 @@ class ScoringEngine:
         if matched_labs:
             lab = matched_labs[-1]
             val_str = f"{lab.value} {lab.unit}"
-            result = _compare_lab(lab.value, operator, value, concept)
+            rule_unit = getattr(rule, "unit", None)
+            result = _compare_lab(lab.value, operator, value, concept, lab.unit, rule_unit)
             if result is True:
                 return (
                     EvaluationStatus.PASS,
@@ -617,6 +702,35 @@ class ScoringEngine:
                 # Weak (uncertain) semantic match → AMBIGUOUS either way.
                 if self._snomed_match_status(score, "PASS") != "PASS":
                     return EvaluationStatus.AMBIGUOUS, f"Possible match for '{concept}' — uncertain (score={score:.2f})", item
+
+                # ── Temporal window check ───────────────────────────────────
+                # If the rule specifies a time window (e.g. "no stroke in past 6 months"),
+                # check whether the matching record actually falls inside the window.
+                # A record that pre-dates the window makes the rule a PASS (the event is
+                # outside the restricted period), not a disqualifying FAIL/TRIGGER.
+                tf_val = getattr(rule, "timeframe_value", None)
+                tf_unit = getattr(rule, "timeframe_unit", None)
+                if tf_val is not None and tf_unit:
+                    cutoff = _timeframe_cutoff(tf_val, tf_unit)
+                    if cutoff is not None:
+                        all_records = list(patient.condition_records) + list(patient.medication_records)
+                        within = _record_within_window(all_records, concept.lower(), cutoff)
+                        if not within:
+                            # Concept exists in patient history but the recorded date
+                            # is outside (older than) the rule's time window → no violation.
+                            msg = (
+                                f"Found '{item}' but onset predates the {tf_val}-{tf_unit} "
+                                f"window (cutoff {cutoff}) — temporal constraint satisfied"
+                            )
+                            logger.info("  TEMPORAL PASS: {}", msg)
+                            if is_inclusion:
+                                return EvaluationStatus.PASS, msg, item
+                            return EvaluationStatus.FAIL, msg, item
+                        logger.info(
+                            "  TEMPORAL FAIL: '{}' onset is within the {}-{} window",
+                            item, tf_val, tf_unit,
+                        )
+
                 if is_inclusion:
                     # Inclusion "must not have X": presence of X violates it → FAIL.
                     return EvaluationStatus.FAIL, f"Found '{item}' which must be absent", item
@@ -667,42 +781,62 @@ class ScoringEngine:
             return EvaluationStatus.AMBIGUOUS, f"Weak match for '{concept}' — uncertain (score={best_score:.2f})", item
 
         return EvaluationStatus.AMBIGUOUS, f"No data found for '{concept}' in patient record", ""
-    def evaluate_patient(
+    async def evaluate_patient(
         self, patient: PatientData, rules: list[CriterionRule]
     ) -> ScoringResult:
         logger.info(
             "=== SCORING PATIENT {} AGAINST {} RULES ===", patient.patient_id, len(rules)
         )
 
+        # Phase 1: run all deterministic rule evaluations synchronously (fast, no I/O)
+        phase1: list[tuple[EvaluationStatus, str, str, CriterionRule]] = []
+        for rule in rules:
+            raw_status, explanation, data_found = self._evaluate_rule(rule, patient)
+            phase1.append((raw_status, explanation, data_found, rule))
+
+        # Phase 2: fire all agentic fallback calls concurrently for ambiguous/failed rules
+        async def _maybe_fallback(
+            idx: int,
+            raw_status: EvaluationStatus,
+            explanation: str,
+            rule: CriterionRule,
+        ) -> tuple[int, EvaluationStatus, str]:
+            if raw_status not in (EvaluationStatus.AMBIGUOUS, EvaluationStatus.FAIL):
+                return idx, raw_status, explanation
+            if rule.concept.lower() in ("age", "gender", "sex"):
+                return idx, raw_status, explanation
+            try:
+                new_status, ai_explanation = await fallback_agent.verify_evaluation(
+                    rule=rule,
+                    patient=patient,
+                    current_status=raw_status,
+                    python_rationale=explanation,
+                )
+                if new_status != raw_status:
+                    return (
+                        idx,
+                        new_status,
+                        f"✨ [AI Agent Override]: {ai_explanation} (Python originally said: {explanation})",
+                    )
+            except Exception as e:
+                logger.error("Agentic fallback failed for rule {}: {}", rule.concept, e)
+            return idx, raw_status, explanation
+
+        fallback_coros = [
+            _maybe_fallback(i, s, e, r) for i, (s, e, _, r) in enumerate(phase1)
+        ]
+        fallback_results = await asyncio.gather(*fallback_coros)
+        # Apply overrides back into phase1
+        for idx, new_status, new_explanation in fallback_results:
+            old_status, _, data_found, rule = phase1[idx]
+            phase1[idx] = (new_status, new_explanation, data_found, rule)
+
+        # Phase 3: build final evaluations list
         raw_evals: list[tuple[EvaluationStatus, CriterionRule]] = []
         db_evaluations: list[CriterionEvaluationCreate] = []
 
-        for rule in rules:
-            # 1. Let the deterministic Python engine try first (The Junior Coordinator)
-            raw_status, explanation, data_found = self._evaluate_rule(rule, patient)
-
-            # 2. THE FALLBACK LOOP (The Senior Doctor)
-            # If Python isn't 100% sure, or if it outright failed the patient, ask the LLM to double check.
-            if raw_status in [EvaluationStatus.AMBIGUOUS, EvaluationStatus.FAIL]:
-                
-                # Skip sending simple demographic checks to the LLM to save time
-                if rule.concept.lower() not in ["age", "gender", "sex"]:
-                    try:
-                        new_status, ai_explanation = fallback_agent.verify_evaluation(
-                            rule=rule,
-                            patient=patient,
-                            current_status=raw_status,
-                            python_rationale=explanation
-                        )
-                        
-                        # If Claude disagreed with Python, override the results!
-                        if new_status != raw_status:
-                            raw_status = new_status
-                            explanation = f"✨ [AI Agent Override]: {ai_explanation} (Python originally said: {explanation})"
-                    except Exception as e:
-                        logger.error("Agentic fallback failed for rule {}: {}", rule.concept, e)
-
-            # 3. Determine if rule is inclusion or exclusion
+        for raw_status, explanation, data_found, rule in phase1:
+            # Determine if rule is inclusion or exclusion
             is_inclusion = (
                 rule.criterion_type == CriterionType.inclusion
                 or (rule.criterion_type != CriterionType.exclusion and rule.required)

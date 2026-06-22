@@ -37,14 +37,14 @@ class AgenticFallbackService:
         - "rationale": A 1-sentence clinical explanation for your decision.
         """)
 
-    def verify_evaluation(
-        self, 
-        rule: CriterionRule, 
-        patient: PatientData, 
-        current_status: EvaluationStatus, 
+    async def verify_evaluation(
+        self,
+        rule: CriterionRule,
+        patient: PatientData,
+        current_status: EvaluationStatus,
         python_rationale: str
     ) -> tuple[EvaluationStatus, str]:
-        
+
         # 1. Summarize the patient chart so we don't blow up the context window
         conditions = [c for c in patient.conditions]
         medications = [m for m in patient.medications]
@@ -53,7 +53,7 @@ class AgenticFallbackService:
         # 2. Ask Claude for a second opinion
         chain = self.prompt | self.llm
         try:
-            response = chain.invoke({
+            response = await chain.ainvoke({
                 "current_status": current_status.value,
                 "criterion_text": rule.criterion_text,
                 "concept": rule.concept,

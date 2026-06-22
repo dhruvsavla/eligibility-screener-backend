@@ -1,7 +1,7 @@
 import json
 from datetime import date, datetime
 from loguru import logger
-from app.models.patient import PatientData, LabResult
+from app.models.patient import PatientData, LabResult, ConditionRecord, MedicationRecord
 
 RELEVANT_LAB_PATTERNS = [
     "hba1c", "hemoglobin a1c", "glycated hemoglobin",
@@ -39,6 +39,16 @@ def _calc_age(birth_date_str: str) -> int | None:
         bd = datetime.strptime(birth_date_str[:10], "%Y-%m-%d").date()
         today = date.today()
         return today.year - bd.year - ((today.month, today.day) < (bd.month, bd.day))
+    except Exception:
+        return None
+
+
+def _parse_fhir_date(raw: str | None) -> date | None:
+    """Safely parse a FHIR dateTime string (ISO-8601) to a Python date. Returns None on failure."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
     except Exception:
         return None
 
@@ -94,10 +104,12 @@ class FHIRParser:
         name = "Unknown"
         age = None
         gender = None
-        conditions = []
-        medications = []
-        lab_results = []
-        allergies = []
+        conditions: list[str] = []
+        medications: list[str] = []
+        lab_results: list = []
+        allergies: list[str] = []
+        condition_records: list[ConditionRecord] = []
+        medication_records: list[MedicationRecord] = []
 
         for res in resources:
             rtype = res.get("resourceType", "")
@@ -120,7 +132,8 @@ class FHIRParser:
                 status_obj = res.get("clinicalStatus", {})
                 status_codings = status_obj.get("coding", [{}])
                 status_code = status_codings[0].get("code", "active") if status_codings else "active"
-                if status_code in ("inactive", "resolved", "remission"):
+                # Allowlist: only include clinically active conditions
+                if status_code not in ("active", "recurrence", "relapse"):
                     continue
                 code_obj = res.get("code", {})
                 display = (
@@ -129,9 +142,15 @@ class FHIRParser:
                     or "Unknown condition"
                 )
                 if display:
+                    onset = _parse_fhir_date(
+                        res.get("onsetDateTime") or res.get("recordedDate")
+                    )
                     conditions.append(display)
+                    condition_records.append(ConditionRecord(name=display, onset_date=onset))
 
             elif rtype == "MedicationRequest":
+                if res.get("status", "active") != "active":
+                    continue
                 med_obj = res.get("medicationCodeableConcept") or res.get("medication", {})
                 if isinstance(med_obj, dict):
                     display = (
@@ -139,7 +158,27 @@ class FHIRParser:
                         or (med_obj.get("coding", [{}])[0].get("display") if med_obj.get("coding") else None)
                     )
                     if display:
+                        onset = _parse_fhir_date(
+                            res.get("authoredOn") or res.get("effectiveDateTime")
+                        )
                         medications.append(display)
+                        medication_records.append(MedicationRecord(name=display, onset_date=onset))
+
+            elif rtype == "MedicationStatement":
+                if res.get("status", "active") != "active":
+                    continue
+                med_obj = res.get("medicationCodeableConcept") or res.get("medication", {})
+                if isinstance(med_obj, dict):
+                    display = (
+                        med_obj.get("text")
+                        or (med_obj.get("coding", [{}])[0].get("display") if med_obj.get("coding") else None)
+                    )
+                    if display:
+                        onset = _parse_fhir_date(
+                            res.get("authoredOn") or res.get("effectiveDateTime")
+                        )
+                        medications.append(display)
+                        medication_records.append(MedicationRecord(name=display, onset_date=onset))
 
             elif rtype == "Observation":
                 code_obj = res.get("code", {})
@@ -198,6 +237,8 @@ class FHIRParser:
             medications=medications,
             lab_results=lab_results,
             allergies=allergies,
+            condition_records=condition_records,
+            medication_records=medication_records,
         )
 
 

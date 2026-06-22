@@ -12,10 +12,15 @@ For each criterion, return a JSON object with these EXACT fields:
   "criterion_text": "the original sentence or phrase verbatim",
   "concept": "the core medical concept (e.g. 'HbA1c', 'age', 'eGFR', 'prior_chemotherapy', 'pregnancy')",
   "operator": "one of the operators listed below",
-  "value": "the threshold, target value, or alternatives as a string",
+  "value": "the numeric threshold only, as a plain number string (e.g. '7.5', '60', '18'). Strip all unit text.",
+  "unit": "the unit of measurement if applicable, as a short string (e.g. '%', 'mL/min/1.73m2', 'g/dL', 'years', 'mg/dL'). Use null if not applicable.",
   "required": true for inclusion criteria (patient MUST have), false for exclusion criteria (patient MUST NOT have),
   "criterion_type": "inclusion" or "exclusion",
-  "confidence": float 0.0-1.0 representing your confidence in the extraction
+  "confidence": float 0.0-1.0 representing your confidence in the extraction,
+  "source_quote": "the VERBATIM, EXACT sentence or clause from the source text from which this rule was extracted. Do NOT paraphrase or summarise — copy the text character-for-character.",
+  "page_number": "the page number as a string (e.g. '3', 'p.7') if the source document contains page markers; use null if the text has no page markers.",
+  "timeframe_value": the numeric duration if the rule specifies a time window (e.g. 6 for 'within 6 months'). Use null if no time window is stated.,
+  "timeframe_unit": "the unit of the time window: 'days', 'weeks', 'months', or 'years'. Use null if no time window is stated."
 }
 
 OPERATOR DEFINITIONS — choose the most specific one that applies:
@@ -45,6 +50,40 @@ Special operators — READ THESE CAREFULLY:
                 Set required=false and confidence=0.5 for these
                 value: describe the condition in plain English
 
+⚠️ CRITICAL — ATOMIC EXTRACTION (READ THIS FIRST, BEFORE ANY OTHER RULE) ⚠️
+
+EVERY "concept" field MUST represent EXACTLY ONE clinical entity.
+You MUST decompose compound sentences into as many separate JSON rule objects as there
+are distinct clinical requirements. NEVER merge multiple diseases, labs, procedures,
+medications, or conditions into a single concept string.
+
+WRONG — one mega-rule that the scoring engine cannot evaluate:
+  {"concept": "diabetes_prior_MI_age_over_18", "operator": "presence", ...}
+
+RIGHT — three atomic rules, each searchable independently:
+  {"concept": "Type 2 diabetes mellitus", "operator": "presence", ...}
+  {"concept": "myocardial infarction", "operator": "history_of", ...}
+  {"concept": "age", "operator": ">", "value": "18", "unit": "years", ...}
+
+MORE EXAMPLES OF REQUIRED DECOMPOSITION:
+  "History of hepatic, renal, or thyroid disease" →
+      THREE rules: concept="hepatic disease", concept="renal disease", concept="thyroid disease"
+      (each with operator="history_of", linked via one_of only if the sentence uses OR logic)
+
+  "Severe cardiovascular, pulmonary, or metabolic disorder" →
+      THREE rules: concept="cardiovascular disorder", concept="pulmonary disorder",
+                   concept="metabolic disorder"
+
+  "Prior surgery, radiation, or chemotherapy" →
+      THREE rules: concept="surgery", concept="radiation therapy", concept="chemotherapy"
+
+  "eGFR < 30 AND platelet count < 100" →
+      TWO rules: one for eGFR, one for platelet count
+
+THE ONLY EXCEPTION: when the sentence uses OR logic, group into one rule using
+operator="one_of" with a JSON array — but each array element must still be a single
+disease/condition, not a compound phrase.
+
 CRITICAL RULES — FOLLOW THESE EXACTLY:
 
 1. OR CONDITIONS: If a criterion says "patients must have A OR B" — extract as ONE rule with
@@ -58,10 +97,32 @@ CRITICAL RULES — FOLLOW THESE EXACTLY:
 3. NEGATIONS: "no prior chemotherapy" → operator="no_history_of" concept="chemotherapy"
    "must not be pregnant" → operator="absence" concept="pregnancy" criterion_type="exclusion"
 
-4. NUMERIC THRESHOLDS: Always strip units from value. "eGFR >= 60 mL/min" → value="60" not "60 mL/min"
+4. NUMERIC THRESHOLDS: Always strip units from value; put the unit in the "unit" field.
+   "eGFR >= 60 mL/min/1.73m2" → value="60", unit="mL/min/1.73m2"
+   "HbA1c >= 7.5%" → value="7.5", unit="%"
+   "hemoglobin >= 10 g/dL" → value="10", unit="g/dL"
+   Non-numeric criteria (presence/absence/history) → unit=null
 
 5. CONFIDENCE: Set confidence < 0.7 if the criterion is ambiguous, uses medical shorthand
    you are uncertain about, or has complex conditional logic.
+
+6. SOURCE TRACEABILITY — MANDATORY FOR EVERY RULE:
+   "source_quote" MUST contain the EXACT, VERBATIM text from the source document that
+   supports this rule. Copy the sentence or clause character-for-character. Do NOT
+   paraphrase, summarise, or rephrase. Clinical coordinators will use this quote to
+   audit the AI's logic against the original protocol document.
+   BAD:  "source_quote": "HbA1c must be above threshold"   ← paraphrase, not allowed
+   GOOD: "source_quote": "Glycated haemoglobin (HbA1c) ≥ 7.5% at screening visit"
+
+   "page_number" should be filled in whenever the source text contains page markers
+   (e.g. "Page 3", "p.7", "[page 12]"). Use null only if the text has no page markers.
+
+7. TEMPORAL LOGIC — extract time windows when present:
+   If a rule specifies a time limit, extract it:
+     "No stroke within the past 6 months" → timeframe_value=6, timeframe_unit="months"
+     "Stable dose for at least 90 days"   → timeframe_value=90, timeframe_unit="days"
+     "Cancer diagnosis within 5 years"    → timeframe_value=5, timeframe_unit="years"
+   Use null for both fields when no time window is stated.
 
 IMPORTANT — BOTH LISTS ARE REQUIRED:
 Protocols contain a separate "Inclusion Criteria" list AND a separate "Exclusion Criteria"
@@ -101,14 +162,30 @@ class CriteriaExtractor:
                 continue
             try:
                 c_type = str(item.get("criterion_type", "inclusion")).lower()
+
+                def _opt_str(raw) -> str | None:
+                    s = str(raw).strip() if raw is not None else ""
+                    return s if s not in ("", "null", "None") else None
+
+                def _opt_float(raw) -> float | None:
+                    try:
+                        return float(raw) if raw is not None and str(raw).strip() not in ("", "null", "None") else None
+                    except (TypeError, ValueError):
+                        return None
+
                 rule = CriterionRuleCreate(
                     criterion_text=item.get("criterion_text", ""),
                     concept=item.get("concept", ""),
                     operator=item.get("operator", "presence"),
                     value=str(item.get("value", "")),
+                    unit=_opt_str(item.get("unit")),
                     required=bool(item.get("required", True)),
                     criterion_type=CriterionType(c_type if c_type in ("inclusion", "exclusion") else "inclusion"),
                     confidence=float(item.get("confidence", 0.5)),
+                    source_quote=_opt_str(item.get("source_quote")),
+                    page_number=_opt_str(item.get("page_number")),
+                    timeframe_value=_opt_float(item.get("timeframe_value")),
+                    timeframe_unit=_opt_str(item.get("timeframe_unit")),
                 )
                 rules.append(rule)
             except Exception as parse_err:
@@ -137,20 +214,30 @@ class CriteriaExtractor:
         return f"""Extract eligibility criteria from trial {nct_id}.
 
 EXAMPLE of correct extraction (do not include this in your output):
-Input: "Patients must be aged 18-65 years and have HbA1c >= 7.5%, or have been
-        diagnosed with Type 1 or Type 2 diabetes. No prior insulin therapy."
+Input (page 4): "Patients must be aged 18-65 years and have HbA1c >= 7.5%.
+                 No stroke in the past 6 months. No prior insulin therapy."
 Correct output:
 [
   {{"criterion_text": "aged 18-65 years", "concept": "age", "operator": "between",
-    "value": "18-65", "required": true, "criterion_type": "inclusion", "confidence": 0.99}},
+    "value": "18-65", "unit": "years", "required": true, "criterion_type": "inclusion",
+    "confidence": 0.99,
+    "source_quote": "Patients must be aged 18-65 years and have HbA1c >= 7.5%.",
+    "page_number": "4", "timeframe_value": null, "timeframe_unit": null}},
   {{"criterion_text": "HbA1c >= 7.5%", "concept": "HbA1c", "operator": ">=",
-    "value": "7.5", "required": true, "criterion_type": "inclusion", "confidence": 0.98}},
-  {{"criterion_text": "Type 1 or Type 2 diabetes", "concept": "diabetes_type",
-    "operator": "one_of", "value": ["Type 1 diabetes mellitus", "Type 2 diabetes mellitus"],
-    "required": true, "criterion_type": "inclusion", "confidence": 0.97}},
+    "value": "7.5", "unit": "%", "required": true, "criterion_type": "inclusion",
+    "confidence": 0.98,
+    "source_quote": "Patients must be aged 18-65 years and have HbA1c >= 7.5%.",
+    "page_number": "4", "timeframe_value": null, "timeframe_unit": null}},
+  {{"criterion_text": "No stroke in the past 6 months", "concept": "stroke",
+    "operator": "no_history_of", "value": "", "unit": null, "required": false,
+    "criterion_type": "exclusion", "confidence": 0.97,
+    "source_quote": "No stroke in the past 6 months.",
+    "page_number": "4", "timeframe_value": 6, "timeframe_unit": "months"}},
   {{"criterion_text": "No prior insulin therapy", "concept": "insulin",
     "operator": "no_history_of", "value": "insulin therapy",
-    "required": false, "criterion_type": "exclusion", "confidence": 0.96}}
+    "unit": null, "required": false, "criterion_type": "exclusion", "confidence": 0.96,
+    "source_quote": "No prior insulin therapy.",
+    "page_number": "4", "timeframe_value": null, "timeframe_unit": null}}
 ]
 {hint_block}
 Now extract from this trial's criteria text:

@@ -126,6 +126,30 @@ async def init_db():
             logger.info("Migration: added score_breakdown_json column to screening_results")
         except Exception:
             pass  # Column already exists
+        # Migration: add unit column to criterion_rules for lab unit normalization
+        try:
+            await db.execute("ALTER TABLE criterion_rules ADD COLUMN unit TEXT")
+            logger.info("Migration: added unit column to criterion_rules")
+        except Exception:
+            pass  # Column already exists
+        # Migration: source traceability columns
+        for col_sql in [
+            "ALTER TABLE criterion_rules ADD COLUMN source_quote TEXT",
+            "ALTER TABLE criterion_rules ADD COLUMN page_number TEXT",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
+        # Migration: temporal logic columns
+        for col_sql in [
+            "ALTER TABLE criterion_rules ADD COLUMN timeframe_value REAL",
+            "ALTER TABLE criterion_rules ADD COLUMN timeframe_unit TEXT",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
         # Migration: add is_ground_truth / ground_truth columns if missing
         for col_sql in [
             "ALTER TABLE patients ADD COLUMN is_ground_truth INTEGER DEFAULT 0",

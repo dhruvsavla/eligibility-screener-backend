@@ -78,18 +78,25 @@ async def _save_protocol_and_rules(
         snomed_code = matches[0]["code"] if matches else None
         await db.execute(
             """INSERT INTO criterion_rules
-               (protocol_id, criterion_text, concept, operator, value, required, criterion_type, snomed_code, confidence)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (protocol_id, criterion_text, concept, operator, value, unit,
+                required, criterion_type, snomed_code, confidence,
+                source_quote, page_number, timeframe_value, timeframe_unit)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 protocol_id,
                 rule.criterion_text,
                 rule.concept,
                 rule.operator,
                 rule.value,
+                rule.unit,
                 1 if rule.required else 0,
                 rule.criterion_type.value,
                 snomed_code,
                 rule.confidence,
+                rule.source_quote,
+                rule.page_number,
+                rule.timeframe_value,
+                rule.timeframe_unit,
             ),
         )
 

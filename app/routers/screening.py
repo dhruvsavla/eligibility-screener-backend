@@ -1,6 +1,7 @@
 import json
 import time
-from fastapi import APIRouter, HTTPException
+import uuid
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from loguru import logger
 from app import database as db
 from app.models.screening import (
@@ -15,6 +16,9 @@ from app.services.scoring_engine import scoring_engine
 from app.services.rationale_generator import rationale_generator
 
 router = APIRouter(prefix="/api", tags=["screening"])
+
+# In-memory job store for background batch screening
+_screening_jobs: dict[str, dict] = {}
 
 
 async def _run_screening(patient_db_id: int, protocol_id: int, use_gpt_rationale: bool = True) -> dict:
@@ -52,17 +56,22 @@ async def _run_screening(patient_db_id: int, protocol_id: int, use_gpt_rationale
                 concept=row.get("concept", ""),
                 operator=row.get("operator", "presence"),
                 value=row.get("value", ""),
+                unit=row.get("unit"),
                 required=bool(row.get("required", True)),
                 criterion_type=CriterionType(row.get("criterion_type", "inclusion")),
                 snomed_code=row.get("snomed_code"),
                 confidence=float(row.get("confidence", 0.5)),
+                source_quote=row.get("source_quote"),
+                page_number=row.get("page_number"),
+                timeframe_value=row.get("timeframe_value"),
+                timeframe_unit=row.get("timeframe_unit"),
             )
             rules.append(rule)
         except Exception as e:
             logger.warning("Skipping malformed rule row {}: {}", row.get("id"), e)
 
     t0 = time.time()
-    scoring_result = scoring_engine.evaluate_patient(patient_data, rules)
+    scoring_result = await scoring_engine.evaluate_patient(patient_data, rules)
     logger.info("Scoring took {}ms", int((time.time() - t0) * 1000))
 
     t0 = time.time()
@@ -161,19 +170,18 @@ async def screen_patient(request: ScreenRequest):
     return result
 
 
-@router.post("/screen/batch")
-async def batch_screen(request: BatchScreenRequest):
+async def _run_batch_screening(job_id: str, request: BatchScreenRequest) -> None:
+    job = _screening_jobs[job_id]
+    job["status"] = "running"
     start = time.time()
     logger.info(
-        "=== BATCH SCREEN: {} patients against protocol {} ===",
-        len(request.patient_ids), request.protocol_id
+        "=== BATCH SCREEN (job={}): {} patients against protocol {} ===",
+        job_id, len(request.patient_ids), request.protocol_id,
     )
     results = []
     for i, pid in enumerate(request.patient_ids):
         try:
-            logger.info("  Screening patient {} ({}/{})", pid, i + 1, len(request.patient_ids))
-            # Skip Claude Sonnet rationale in batch mode — use fast fallback instead.
-            # Full rationale can be fetched per-patient from the Results page.
+            logger.info("  [job={}] Screening patient {} ({}/{})", job_id, pid, i + 1, len(request.patient_ids))
             result = await _run_screening(pid, request.protocol_id, use_gpt_rationale=False)
             results.append(result)
         except HTTPException as e:
@@ -182,12 +190,40 @@ async def batch_screen(request: BatchScreenRequest):
         except Exception as e:
             logger.error("Unexpected error screening patient {}: {}", pid, e)
             results.append({"patient_id": pid, "error": str(e)})
+        job["progress"] = i + 1
+        job["results"] = results
 
+    elapsed = int((time.time() - start) * 1000)
+    job["status"] = "complete"
+    job["elapsed_ms"] = elapsed
+    logger.info("✓ Batch job {} complete: {} results in {}ms", job_id, len(results), elapsed)
+
+
+@router.post("/screen/batch", status_code=202)
+async def batch_screen(request: BatchScreenRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid.uuid4())
+    _screening_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "progress": 0,
+        "total": len(request.patient_ids),
+        "results": [],
+        "elapsed_ms": None,
+    }
+    background_tasks.add_task(_run_batch_screening, job_id, request)
     logger.info(
-        "✓ Batch screening complete: {} results in {}ms",
-        len(results), int((time.time() - start) * 1000)
+        "=== BATCH SCREEN QUEUED (job={}): {} patients against protocol {} ===",
+        job_id, len(request.patient_ids), request.protocol_id,
     )
-    return results
+    return {"job_id": job_id, "status": "pending", "total": len(request.patient_ids)}
+
+
+@router.get("/screen/status/{job_id}")
+async def get_screening_job_status(job_id: str):
+    job = _screening_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Screening job '{job_id}' not found")
+    return job
 
 
 @router.get("/results")
