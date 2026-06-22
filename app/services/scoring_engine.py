@@ -374,15 +374,27 @@ class ScoringEngine:
                 return True, item, 1.0
 
             # (c) FAISS semantic expansion via SNOMED terms
+            # (c) FAISS semantic expansion via SNOMED terms
             for term in best_terms:
-                words = [w for w in term.split() if len(w) > 3]
-                if any(w in item_lower for w in words):
+                term_lower = term.lower().strip()
+                
+                # Check for a direct phrase match first
+                if term_lower in item_lower or item_lower in term_lower:
                     logger.debug(
-                        "concept match '{}' ← patient '{}' via FAISS (score={:.2f})",
+                        "concept match '{}' ← patient '{}' via FAISS exact phrase (score={:.2f})",
                         concept, item, best_score,
                     )
                     return True, item, best_score
-
+                
+                # Fallback to ALL-WORD match (not ANY word) to prevent single-word false positives.
+                # E.g., Both "anterior" AND "myocardial" AND "infarction" must be present.
+                term_words = [w for w in term_lower.split() if len(w) > 4 and w not in _GENERIC]
+                if term_words and all(w in item_lower for w in term_words):
+                    logger.debug(
+                        "concept match '{}' ← patient '{}' via FAISS all-word overlap (score={:.2f})",
+                        concept, item, best_score,
+                    )
+                    return True, item, best_score
         return False, "", best_score
 
     def _is_unverifiable_inclusion(self, rule: CriterionRule) -> bool:
@@ -677,15 +689,35 @@ class ScoringEngine:
             )
 
         # ── Presence / history_of ──────────────────────────────────────────
+        # ── Presence / history_of ──────────────────────────────────────────
         if operator in ("presence", "history_of"):
             found, item, score = self._concept_in_list(concept, patient.conditions + patient.medications)
             if found:
                 final = self._snomed_match_status(score, "PASS")
                 if final == "PASS":
+                    # --- NEW TEMPORAL CHECK FOR PRESENCE ---
+                    tf_val = getattr(rule, "timeframe_value", None)
+                    tf_unit = getattr(rule, "timeframe_unit", None)
+                    
+                    if tf_val is not None and tf_unit:
+                        cutoff = _timeframe_cutoff(tf_val, tf_unit)
+                        if cutoff is not None:
+                            all_records = list(patient.condition_records) + list(patient.medication_records)
+                            within = _record_within_window(all_records, concept.lower(), cutoff)
+                            
+                            if not within:
+                                # The condition exists, but it is OLDER than the required window.
+                                msg = f"Found '{item}' but onset predates the {tf_val}-{tf_unit} window (cutoff {cutoff})"
+                                logger.info("  TEMPORAL MISS (PRESENCE): {}", msg)
+                                # Fails the presence requirement (which is a GOOD thing if it's an exclusion)
+                                return EvaluationStatus.FAIL, msg, item
+                                
+                            return EvaluationStatus.PASS, f"Found '{item}' within the required {tf_val}-{tf_unit} window", item
+                    # ----------------------------------------
+                    
                     return EvaluationStatus.PASS, f"Found '{item}' in patient record", item
                 return EvaluationStatus.AMBIGUOUS, f"Weak match for '{concept}' in patient record — uncertain", item
             return EvaluationStatus.AMBIGUOUS, f"No evidence of '{concept}' in patient record", ""
-
         # ── Absence operators ──────────────────────────────────────────────
         # _evaluate_rule returns RAW status in PRESENCE semantics (PASS = concept
         # detected in the patient). The downstream inversion (for exclusion rules)
@@ -788,13 +820,18 @@ class ScoringEngine:
             "=== SCORING PATIENT {} AGAINST {} RULES ===", patient.patient_id, len(rules)
         )
 
-        # Phase 1: run all deterministic rule evaluations synchronously (fast, no I/O)
+        # Phase 1: run all deterministic rule evaluations synchronously
         phase1: list[tuple[EvaluationStatus, str, str, CriterionRule]] = []
         for rule in rules:
             raw_status, explanation, data_found = self._evaluate_rule(rule, patient)
             phase1.append((raw_status, explanation, data_found, rule))
 
+        # --- ADD THIS SEMAPHORE ---
+        # Limit to 3 concurrent API calls to prevent Anthropic Rate Limit (429) crashes
+        semaphore = asyncio.Semaphore(3) 
+
         # Phase 2: fire all agentic fallback calls concurrently for ambiguous/failed rules
+        # Phase 2: fire all agentic fallback calls concurrently
         async def _maybe_fallback(
             idx: int,
             raw_status: EvaluationStatus,
@@ -805,21 +842,29 @@ class ScoringEngine:
                 return idx, raw_status, explanation
             if rule.concept.lower() in ("age", "gender", "sex"):
                 return idx, raw_status, explanation
-            try:
-                new_status, ai_explanation = await fallback_agent.verify_evaluation(
-                    rule=rule,
-                    patient=patient,
-                    current_status=raw_status,
-                    python_rationale=explanation,
-                )
-                if new_status != raw_status:
-                    return (
-                        idx,
-                        new_status,
-                        f"✨ [AI Agent Override]: {ai_explanation} (Python originally said: {explanation})",
+            
+            # Use the semaphore to limit concurrent connections
+            async with semaphore:
+                try:
+                    # --- FIX: ARTIFICIAL DELAY FOR API RATE LIMITS ---
+                    # Forces the engine to wait 2 seconds between requests to prevent 429 errors
+                    await asyncio.sleep(2) 
+                    # -------------------------------------------------
+
+                    new_status, ai_explanation = await fallback_agent.verify_evaluation(
+                        rule=rule,
+                        patient=patient,
+                        current_status=raw_status,
+                        python_rationale=explanation,
                     )
-            except Exception as e:
-                logger.error("Agentic fallback failed for rule {}: {}", rule.concept, e)
+                    if new_status != raw_status:
+                        return (
+                            idx,
+                            new_status,
+                            f"✨ [AI Agent Override]: {ai_explanation} (Python originally said: {explanation})",
+                        )
+                except Exception as e:
+                    logger.error("Agentic fallback failed for rule {}: {}", rule.concept, e)
             return idx, raw_status, explanation
 
         fallback_coros = [

@@ -44,13 +44,22 @@ def _calc_age(birth_date_str: str) -> int | None:
 
 
 def _parse_fhir_date(raw: str | None) -> date | None:
-    """Safely parse a FHIR dateTime string (ISO-8601) to a Python date. Returns None on failure."""
     if not raw:
         return None
+    raw = raw[:10]  # Grab up to YYYY-MM-DD
     try:
-        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        # Full date
+        if len(raw) == 10:
+            return datetime.strptime(raw, "%Y-%m-%d").date()
+        # Year and Month only
+        elif len(raw) == 7:
+            return datetime.strptime(raw + "-01", "%Y-%m-%d").date()
+        # Year only
+        elif len(raw) == 4:
+            return datetime.strptime(raw + "-01-01", "%Y-%m-%d").date()
     except Exception:
         return None
+    return None
 
 
 KNOWN_LOINC_CODES = {
