@@ -261,6 +261,16 @@ async def upload_patients_bulk(files: List[UploadFile] = File(...)):
     return {"imported": imported, "skipped": skipped, "failed": failed, "errors": errors}
 
 
+@router.delete("")
+async def delete_all_patients():
+    result = await db.fetch_one("SELECT COUNT(*) as total FROM patients")
+    total = result["total"] if result else 0
+    await db.execute("DELETE FROM screening_results")
+    await db.execute("DELETE FROM patients")
+    logger.info("Deleted all {} patients", total)
+    return {"detail": f"Deleted {total} patients"}
+
+
 @router.delete("/{patient_id}")
 async def delete_patient(patient_id: int):
     row = await db.fetch_one("SELECT id FROM patients WHERE id = ?", (patient_id,))
